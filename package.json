@@ -1,0 +1,45 @@
+{
+  "name": "pi-herdr-fleet",
+  "version": "0.2.0",
+  "description": "Herdr-native interactive multi-agent orchestration for Pi with role-based model routing, socket lifecycle events, and peer messaging.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "herdr",
+    "subagents",
+    "multi-agent",
+    "fleet",
+    "orchestration"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/bun": "latest",
+    "typescript": "^7.0.2"
+  },
+  "files": [
+    "LICENSE",
+    "src/",
+    "agents/",
+    "README.md",
+    "README.ja.md",
+    "config.example.json",
+    "tsconfig.json"
+  ]
+}

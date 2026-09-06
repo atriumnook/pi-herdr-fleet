@@ -1,0 +1,29 @@
+{
+  "runtime": "herdr",
+  "maxConcurrent": 6,
+  "maxDepth": 2,
+  "notifyOnComplete": true,
+  "recentReadLines": 160,
+  "roles": {
+    "scout": {
+      "model": "provider/fast-model",
+      "thinking": "medium",
+      "worktree": false
+    },
+    "planner": {
+      "model": "provider/strong-model",
+      "thinking": "high",
+      "worktree": false
+    },
+    "worker": {
+      "model": "provider/strong-model",
+      "thinking": "high",
+      "worktree": false
+    },
+    "reviewer": {
+      "model": "provider/review-model",
+      "thinking": "high",
+      "worktree": false
+    }
+  }
+}
