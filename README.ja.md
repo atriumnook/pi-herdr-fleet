@@ -115,7 +115,13 @@ pi install "$(pwd)"
 
 ## ステータス
 
-Experimental。registry と socket event のテストは含まれています。実 Herdr + Pi + 実モデルでの E2E test は未完了です。
+Herdr 0.8.2 と Pi 0.85.0 でライブ E2E テスト済み。
+
+カバー範囲:
+spawn、ライフサイクル完了通知、モデルルーティング、ピアメッセージング、
+エージェント制御、worktree 分離、同時実行制限とネスト。
+
+blocked・startup-blocked のフローは、決定論的な E2E テストではまだカバーされていません。
 
 ## クレジット
 

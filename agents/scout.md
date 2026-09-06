@@ -1,6 +1,6 @@
 ---
 name: scout
-description: Fast read-only reconnaissance: locate files, trace behavior, map dependencies, and return evidence.
+description: "Fast read-only reconnaissance: locate files, trace behavior, map dependencies, and return evidence."
 tools: read, bash, grep, find, ls
 thinking: medium
 worktree: false

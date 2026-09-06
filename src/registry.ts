@@ -10,10 +10,19 @@ interface RegistryEvent {
 }
 
 function slug(value: string, max = 20): string {
-  const normalized = value.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
-  const safe = /^[a-z]/.test(normalized) ? normalized : `a-${normalized || "agent"}`;
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const safe = /^[a-z]/.test(normalized)
+    ? normalized
+    : `a-${normalized || "agent"}`;
   return safe.slice(0, max).replace(/-+$/g, "") || "agent";
 }
+
+// Terminal output snapshots dominate registry volume; cap what is persisted so
+// a long session cannot turn every registry read into megabytes of parsing.
+const MAX_STORED_OUTPUT = 4_000;
 
 export function makeId(): string {
   return crypto.randomBytes(4).toString("hex");
@@ -25,10 +34,18 @@ export function makeGroupId(): string {
 
 export function makeHerdrName(group: string, role: string, id: string): string {
   const suffix = id.slice(0, 4);
-  return slug(`${group.replace(/^fleet-/, "f")}-${slug(role, 12)}-${suffix}`, 32);
+  return slug(
+    `${group.replace(/^fleet-/, "f")}-${slug(role, 12)}-${suffix}`,
+    32,
+  );
 }
 
 export class RunRegistry {
+  private runs = new Map<string, AgentRun>();
+  private parseOffset = 0; // byte offset just past the last fully parsed line
+  private statMtimeMs = -1;
+  private statSize = -1;
+
   constructor(
     readonly filePath: string,
     readonly group: string,
@@ -39,28 +56,82 @@ export class RunRegistry {
   }
 
   upsert(run: AgentRun): void {
-    const event: RegistryEvent = { group: this.group, at: Date.now(), run: { ...run } };
-    fs.appendFileSync(this.filePath, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
+    const stored: AgentRun =
+      run.lastOutput && run.lastOutput.length > MAX_STORED_OUTPUT
+        ? { ...run, lastOutput: run.lastOutput.slice(-MAX_STORED_OUTPUT) }
+        : run;
+    const event: RegistryEvent = {
+      group: this.group,
+      at: Date.now(),
+      run: { ...stored },
+    };
+    fs.appendFileSync(this.filePath, `${JSON.stringify(event)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
   }
 
   all(): AgentRun[] {
-    let text = "";
+    // The JSONL is append-only and shared by several processes, so parse only
+    // the bytes appended since the previous read instead of re-reading and
+    // re-parsing the whole file on every registry write.
+    let stat: fs.Stats;
     try {
-      text = fs.readFileSync(this.filePath, "utf8");
+      stat = fs.statSync(this.filePath);
     } catch {
+      this.runs.clear();
+      this.parseOffset = 0;
+      this.statMtimeMs = -1;
+      this.statSize = -1;
       return [];
     }
-    const map = new Map<string, AgentRun>();
-    for (const line of text.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const event = JSON.parse(line) as RegistryEvent;
-        if (event.group === this.group && event.run?.id) map.set(event.run.id, event.run);
-      } catch {
-        // Ignore a partial trailing line after an interrupted write.
-      }
+    if (stat.mtimeMs === this.statMtimeMs && stat.size === this.statSize) {
+      return this.sorted();
     }
-    return [...map.values()].sort((a, b) => a.startedAt - b.startedAt);
+    if (stat.size < this.parseOffset) {
+      // The file was replaced or truncated; start over.
+      this.runs.clear();
+      this.parseOffset = 0;
+    }
+    this.statMtimeMs = stat.mtimeMs;
+    this.statSize = stat.size;
+    if (stat.size === this.parseOffset) return this.sorted();
+    let handle: number;
+    try {
+      handle = fs.openSync(this.filePath, "r");
+    } catch {
+      return this.sorted();
+    }
+    try {
+      const length = stat.size - this.parseOffset;
+      const buffer = Buffer.alloc(length);
+      fs.readSync(handle, buffer, 0, length, this.parseOffset);
+      // Only consume up to the last complete line; a partial trailing write is
+      // re-parsed once its newline arrives.
+      const newline = buffer.lastIndexOf(0x0a);
+      if (newline >= 0) {
+        const complete = buffer.subarray(0, newline + 1).toString("utf8");
+        this.parseOffset += newline + 1;
+        for (const line of complete.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            const event = JSON.parse(line) as RegistryEvent;
+            if (event.group === this.group && event.run?.id) {
+              this.runs.set(event.run.id, event.run);
+            }
+          } catch {
+            // Ignore a malformed line; one bad write must not poison the cache.
+          }
+        }
+      }
+    } finally {
+      fs.closeSync(handle);
+    }
+    return this.sorted();
+  }
+
+  private sorted(): AgentRun[] {
+    return [...this.runs.values()].sort((a, b) => a.startedAt - b.startedAt);
   }
 
   byPane(paneId: string): AgentRun | undefined {

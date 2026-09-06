@@ -115,7 +115,13 @@ pi install "$(pwd)"
 
 ## Status
 
-Experimental. Registry and socket-event tests are included. Live Herdr + Pi + model E2E coverage is still pending.
+Live E2E tested with Herdr 0.8.2 and Pi 0.85.0.
+
+Covered:
+spawn, lifecycle completion, model routing, peer messaging,
+agent controls, worktree isolation, concurrency and nesting.
+
+Blocked/startup-blocked flows are not yet covered by deterministic E2E tests.
 
 ## Credits
 

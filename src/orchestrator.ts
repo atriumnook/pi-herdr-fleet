@@ -1,11 +1,23 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { findAgent } from "./agents.js";
 import { HerdrCommandError } from "./herdr.js";
 import { HerdrEventSubscriber, type HerdrSocketEvent } from "./herdr-events.js";
-import { makeHerdrName, makeId, RunRegistry } from "./registry.js";
+import { makeHerdrName, makeId, type RunRegistry } from "./registry.js";
 import type { AgentRuntime } from "./runtime.js";
-import type { AgentDefinition, AgentRun, AgentState, FleetConfig, SpawnRequest, ThinkingLevel } from "./types.js";
+import type {
+  AgentDefinition,
+  AgentRun,
+  AgentState,
+  FleetConfig,
+  SpawnRequest,
+  ThinkingLevel,
+} from "./types.js";
 
 interface PendingTurn {
   notify: boolean;
@@ -22,14 +34,25 @@ function withThinking(model: string, thinking?: ThinkingLevel): string {
 
 function modelFromContext(ctx: ExtensionContext): string | undefined {
   const model = ctx.model;
-  if (!model?.provider || !model?.id || model.provider === "unknown") return undefined;
+  if (!model?.provider || !model?.id || model.provider === "unknown")
+    return undefined;
   return `${model.provider}/${model.id}`;
 }
 
-function ensureFleetTools(tools: string[] | undefined, canSpawn: boolean): string[] | undefined {
+function ensureFleetTools(
+  tools: string[] | undefined,
+  canSpawn: boolean,
+): string[] | undefined {
   if (!tools) return undefined;
   const set = new Set(tools);
-  for (const name of ["agent_send", "agent_wait", "agent_read", "agent_list", "agent_interrupt", "agent_focus"]) {
+  for (const name of [
+    "agent_send",
+    "agent_wait",
+    "agent_read",
+    "agent_list",
+    "agent_interrupt",
+    "agent_focus",
+  ]) {
     set.add(name);
   }
   if (canSpawn) set.add("agent_spawn");
@@ -54,8 +77,15 @@ export class Orchestrator {
   private readonly pending = new Map<string, PendingTurn>();
   private readonly generations = new Map<string, number>();
   private readonly reconcileLocks = new Map<string, Promise<void>>();
+  private readonly settleChecks = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+  private spawnGate: Promise<void> = Promise.resolve();
+  private syncInFlight?: Promise<void>;
   private eventsStarted = false;
-  private eventState: "connecting" | "connected" | "reconnecting" | "stopped" = "stopped";
+  private eventState: "connecting" | "connected" | "reconnecting" | "stopped" =
+    "stopped";
   private readonly events: HerdrEventSubscriber;
 
   constructor(
@@ -98,48 +128,114 @@ export class Orchestrator {
     this.eventsStarted = true;
     this.eventState = "connecting";
     this.onChanged();
-    await this.events.ensurePanes(this.list().filter(isLive).map((run) => run.paneId));
+    // Prune runs whose pane is already gone BEFORE building the subscription
+    // set: herdr rejects a pane.agent_status_changed subscription for a closed
+    // pane with pane_not_found, which would otherwise wedge the subscriber in
+    // a reconnect loop and permanently leak concurrency slots.
+    await this.pruneOrphanRuns();
+    await this.events.ensurePanes(
+      this.list()
+        .filter(isLive)
+        .map((run) => run.paneId),
+    );
     await this.events.start();
   }
 
   stopEvents(): void {
     this.eventsStarted = false;
     this.eventState = "stopped";
+    for (const timer of this.settleChecks.values()) clearTimeout(timer);
+    this.settleChecks.clear();
     this.events.stop();
     this.onChanged();
   }
 
   async syncEvents(): Promise<void> {
     if (!this.eventsStarted) return;
-    await this.events.ensurePanes(this.list().filter(isLive).map((run) => run.paneId));
+    // Registry writes fire the watcher on every save; coalesce overlapping
+    // syncs so a write burst cannot pile up herdr CLI round-trips.
+    if (this.syncInFlight) return this.syncInFlight;
+    this.syncInFlight = (async () => {
+      await this.pruneOrphanRuns();
+      await this.events.ensurePanes(
+        this.list()
+          .filter(isLive)
+          .map((run) => run.paneId),
+      );
+    })().finally(() => {
+      this.syncInFlight = undefined;
+    });
+    return this.syncInFlight;
+  }
+
+  /**
+   * Runs whose pane has disappeared can never settle: herdr will not accept
+   * subscriptions for their closed panes and the concurrency budget still
+   * counts them as active. Mark them stopped before they poison the pane set.
+   * A freshly split pane can be invisible to `herdr pane get` for a moment,
+   * so young runs and a not-found result are both re-checked before pruning.
+   */
+  private async pruneOrphanRuns(): Promise<void> {
+    for (const run of this.list().filter(isLive)) {
+      if (Date.now() - run.startedAt < 10_000) continue;
+      if (!(await this.paneGone(run.paneId))) continue;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      if (!(await this.paneGone(run.paneId))) continue;
+      run.state = "stopped";
+      run.updatedAt = Date.now();
+      this.pending.delete(run.id);
+      this.save(run);
+    }
+  }
+
+  private async paneGone(paneId: string): Promise<boolean> {
+    try {
+      return !(await this.runtime.paneExists(paneId));
+    } catch {
+      return false; // Unknown failures must not destroy live runs.
+    }
   }
 
   async spawn(request: SpawnRequest, ctx: ExtensionContext): Promise<AgentRun> {
     if (this.depth >= this.config.maxDepth) {
-      throw new Error(`Agent nesting limit reached: depth=${this.depth}, maxDepth=${this.config.maxDepth}`);
-    }
-
-    const active = this.registry.all().filter((r) => r.state === "starting" || r.state === "working");
-    if (active.length >= this.config.maxConcurrent) {
-      throw new Error(`Agent concurrency limit reached: ${active.length}/${this.config.maxConcurrent}`);
+      throw new Error(
+        `Agent nesting limit reached: depth=${this.depth}, maxDepth=${this.config.maxDepth}`,
+      );
     }
 
     const definition = findAgent(this.agents, request.role);
     if (!definition) {
-      throw new Error(`Unknown agent role: ${request.role}. Available: ${this.agents.map((a) => a.name).join(", ")}`);
+      throw new Error(
+        `Unknown agent role: ${request.role}. Available: ${this.agents.map((a) => a.name).join(", ")}`,
+      );
     }
 
-    const override = this.config.roles[definition.name] ?? this.config.roles[request.role] ?? {};
-    const model = request.model ?? override.model ?? definition.model ?? this.config.defaultModel ?? modelFromContext(ctx);
+    const override =
+      this.config.roles[definition.name] ??
+      this.config.roles[request.role] ??
+      {};
+    const model =
+      request.model ??
+      override.model ??
+      definition.model ??
+      this.config.defaultModel ??
+      modelFromContext(ctx);
     const thinking =
       request.thinking ??
       override.thinking ??
       definition.thinking ??
       this.config.defaultThinking ??
       this.pi.getThinkingLevel();
-    const worktree = request.worktree ?? override.worktree ?? definition.worktree ?? false;
-    const interactive = request.interactive ?? override.interactive ?? definition.interactive ?? false;
-    const canSpawn = (override.spawning ?? definition.spawning ?? false) && this.depth + 1 < this.config.maxDepth;
+    const worktree =
+      request.worktree ?? override.worktree ?? definition.worktree ?? false;
+    const interactive =
+      request.interactive ??
+      override.interactive ??
+      definition.interactive ??
+      false;
+    const canSpawn =
+      (override.spawning ?? definition.spawning ?? false) &&
+      this.depth + 1 < this.config.maxDepth;
     const requestedCwd = path.resolve(request.cwd ?? this.cwd);
     const id = makeId();
     const herdrName = makeHerdrName(this.group, definition.name, id);
@@ -150,15 +246,6 @@ export class Orchestrator {
       PI_HERDR_FLEET_DEPTH: String(this.depth + 1),
       PI_HERDR_FLEET_REGISTRY: this.registry.filePath,
     };
-
-    const location = await this.runtime.createLocation({
-      cwd: requestedCwd,
-      label: displayName,
-      worktree,
-      branch,
-      direction: request.direction,
-      env: fleetEnv,
-    });
 
     const tools = ensureFleetTools(definition.tools, canSpawn);
     const systemPrompt = [
@@ -172,54 +259,106 @@ export class Orchestrator {
       "If a peer is blocked, inspect its output and escalate the approval/question to the human; never answer a blocked prompt automatically.",
       "Treat Herdr 'unknown' as uncertainty, not completion.",
       "At the end of each delegated turn, finish with a compact HANDOFF section containing outcome, changed files, verification, and unresolved questions.",
-      canSpawn ? "You may spawn a child agent when decomposition materially improves the result." : "Do not spawn child agents from this session.",
+      canSpawn
+        ? "You may spawn a child agent when decomposition materially improves the result."
+        : "Do not spawn child agents from this session.",
     ].join("\n");
 
     const piArgs: string[] = [];
     if (model) piArgs.push("--model", withThinking(model, thinking));
     if (tools?.length) piArgs.push("--tools", tools.join(","));
     if (!canSpawn) piArgs.push("--exclude-tools", "agent_spawn");
-    piArgs.push("--append-system-prompt", systemPrompt);
     piArgs.push("--name", `fleet:${displayName}`);
 
-    const now = Date.now();
-    const run: AgentRun = {
-      id,
-      name: displayName,
-      role: definition.name,
-      herdrName,
-      paneId: location.paneId,
-      workspaceId: location.workspaceId,
-      cwd: location.cwd,
-      model,
-      thinking,
-      state: "starting",
-      depth: this.depth + 1,
-      interactive,
-      worktree,
-      startedAt: now,
-      updatedAt: now,
-    };
-    this.save(run);
+    // The concurrency budget counts runs from the shared registry, so the
+    // check-to-first-save window must be atomic: parallel agent_spawn calls
+    // would otherwise all observe an empty budget and overshoot the limit.
+    const previousGate = this.spawnGate;
+    let releaseGate!: () => void;
+    this.spawnGate = new Promise<void>((resolveGate) => {
+      releaseGate = resolveGate;
+    });
+    await previousGate;
+    let run: AgentRun;
+    try {
+      const active = this.registry
+        .all()
+        .filter((r) => r.state === "starting" || r.state === "working");
+      if (active.length >= this.config.maxConcurrent) {
+        throw new Error(
+          `Agent concurrency limit reached: ${active.length}/${this.config.maxConcurrent}`,
+        );
+      }
+      const location = await this.runtime.createLocation({
+        cwd: requestedCwd,
+        label: displayName,
+        worktree,
+        branch,
+        direction: request.direction,
+        env: fleetEnv,
+      });
+      const now = Date.now();
+      run = {
+        id,
+        name: displayName,
+        role: definition.name,
+        herdrName,
+        paneId: location.paneId,
+        workspaceId: location.workspaceId,
+        cwd: location.cwd,
+        model,
+        thinking,
+        state: "starting",
+        depth: this.depth + 1,
+        interactive,
+        worktree,
+        startedAt: now,
+        updatedAt: now,
+      };
+      this.save(run);
+    } finally {
+      releaseGate();
+    }
+
+    // Herdr re-encodes agent arguments through the target shell and rejects
+    // multiline argv elements, so the multiline fleet prompt cannot be passed
+    // inline. pi reads --append-system-prompt from a file path; hand the prompt
+    // over as a file instead.
+    const promptFile = path.join(os.tmpdir(), `pi-herdr-fleet-prompt-${id}.md`);
+    fs.writeFileSync(promptFile, systemPrompt, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    piArgs.push("--append-system-prompt", promptFile);
 
     try {
-      const started = await this.runtime.start(herdrName, location.paneId, piArgs);
+      const started = await this.runtime.start(herdrName, run.paneId, piArgs);
       run.state = started.status;
     } catch (error) {
-      if (error instanceof HerdrCommandError && error.codeName === "agent_not_ready") {
+      if (
+        error instanceof HerdrCommandError &&
+        error.codeName === "agent_not_ready"
+      ) {
         // Herdr keeps the live agent name when startup reaches a blocked UI.
         // Do not inject the delegated task through that approval/question.
-        const current = await this.runtime.get(herdrName).catch(() => ({ status: "unknown" as const }));
+        const current = await this.runtime
+          .get(herdrName)
+          .catch(() => ({ status: "unknown" as const }));
         run.state = current.status;
-        run.lastError = "Agent started but is not ready for prompts; delegated task has not been submitted.";
+        run.lastError =
+          "Agent started but is not ready for prompts; delegated task has not been submitted.";
       } else {
         run.state = "failed";
         run.lastError = error instanceof Error ? error.message : String(error);
         run.updatedAt = Date.now();
         this.save(run);
+        // The agent never started; an empty leftover pane would be an orphan.
+        await this.runtime.closePane(run.paneId).catch(() => undefined);
+        void fs.promises.rm(promptFile, { force: true }).catch(() => undefined);
         throw error;
       }
     }
+    void fs.promises.rm(promptFile, { force: true }).catch(() => undefined);
     run.updatedAt = Date.now();
     this.save(run);
 
@@ -242,7 +381,11 @@ export class Orchestrator {
       // unsent; caller can focus/read the pane, resolve it, then agent_send.
       return run;
     }
-    void this.submit(run, request.task, !run.interactive);
+    // Await the submission: the tool contract is "returns after launch and
+    // prompt submission", and the concurrency budget counts working runs from
+    // the shared registry — a fire-and-forget submit would let the next spawn
+    // observe the previous agent as still `starting` and exceed the limit.
+    await this.submit(run, request.task, !run.interactive);
     return run;
   }
 
@@ -257,12 +400,17 @@ export class Orchestrator {
     const state = await this.runtime.wait(run.herdrName, timeoutMs);
     this.updateState(run, state.status);
     const pending = this.pending.get(run.id);
-    if (pending?.armed && run.state === "blocked") await this.notifyBlocked(run, pending);
-    else if (pending?.armed && isCompleted(run.state)) await this.finalize(run, pending);
+    if (pending?.armed && run.state === "blocked")
+      await this.notifyBlocked(run, pending);
+    else if (pending?.armed && isCompleted(run.state))
+      await this.finalize(run, pending);
     return run;
   }
 
-  async read(target: string, lines = this.config.recentReadLines): Promise<string> {
+  async read(
+    target: string,
+    lines = this.config.recentReadLines,
+  ): Promise<string> {
     const run = this.mustResolve(target);
     return this.runtime.read(run.herdrName, lines);
   }
@@ -270,7 +418,9 @@ export class Orchestrator {
   async interrupt(target: string): Promise<AgentRun> {
     const run = this.mustResolve(target);
     await this.runtime.interrupt(run.herdrName);
-    const current = await this.runtime.get(run.herdrName).catch(() => ({ status: "unknown" as const }));
+    const current = await this.runtime
+      .get(run.herdrName)
+      .catch(() => ({ status: "unknown" as const }));
     this.updateState(run, current.status);
     return run;
   }
@@ -287,7 +437,11 @@ export class Orchestrator {
     return run;
   }
 
-  private async submit(run: AgentRun, text: string, notify: boolean): Promise<AgentRun> {
+  private async submit(
+    run: AgentRun,
+    text: string,
+    notify: boolean,
+  ): Promise<AgentRun> {
     const generation = (this.generations.get(run.id) ?? 0) + 1;
     this.generations.set(run.id, generation);
     const pending: PendingTurn = { notify, armed: false, generation };
@@ -296,23 +450,52 @@ export class Orchestrator {
     try {
       // The socket subscription is established before submission. The prompt
       // itself intentionally does not use --wait; settlement is pushed by Herdr.
-      await this.events.ensurePanes(this.list().filter(isLive).map((item) => item.paneId));
+      await this.events.ensurePanes(
+        this.list()
+          .filter(isLive)
+          .map((item) => item.paneId),
+      );
       const submitted = await this.runtime.prompt(run.herdrName, text);
-      this.updateState(run, submitted.status);
+      // Herdr reports the pre-visual state right after a prompt (usually
+      // "idle" because the TUI has not flipped yet). A submitted turn IS
+      // running: record it as working so concurrency accounting and the fleet
+      // widget stay truthful until Herdr reports a real settlement.
+      this.updateState(
+        run,
+        submitted.status === "idle" ||
+          submitted.status === "unknown" ||
+          submitted.status === "done"
+          ? "working"
+          : submitted.status,
+      );
       pending.armed = true;
-
-      // Reconcile once after prompt acknowledgement to close the tiny race where
-      // a very fast turn settles before the socket event reaches this process.
-      await this.reconcileRun(run);
+      if (submitted.status !== "working") {
+        // An extremely fast turn can settle while the prompt command is still
+        // in flight, or settle before the TUI ever flips to working; in both
+        // cases no further status event may arrive and the run would latch as
+        // "working" forever. Verify after a short grace period — verifying
+        // immediately would mistake pre-visual idle for a settled turn: if the
+        // agent already settled, finalize; if it is working, events take over.
+        const timer = setTimeout(() => {
+          this.settleChecks.delete(run.id);
+          if (this.pending.has(run.id)) void this.reconcileRun(run);
+        }, 2_500);
+        this.settleChecks.set(run.id, timer);
+      }
       return run;
     } catch (error) {
-      if (error instanceof HerdrCommandError && error.codeName === "agent_blocked") {
+      if (
+        error instanceof HerdrCommandError &&
+        error.codeName === "agent_blocked"
+      ) {
         // Herdr rejected the prompt before sending input. Do not retain this as
         // an in-flight turn; surface the blocker and let the caller retry after
         // the human resolves it.
         this.pending.delete(run.id);
         this.updateState(run, "blocked");
-        run.lastOutput = await this.runtime.read(run.herdrName, this.config.recentReadLines).catch(() => undefined);
+        run.lastOutput = await this.runtime
+          .read(run.herdrName, this.config.recentReadLines)
+          .catch(() => undefined);
         run.updatedAt = Date.now();
         this.save(run);
         return run;
@@ -328,12 +511,19 @@ export class Orchestrator {
   }
 
   private async handleSocketEvent(event: HerdrSocketEvent): Promise<void> {
-    const paneId = typeof event.data.pane_id === "string" ? event.data.pane_id : undefined;
+    const paneId =
+      typeof event.data.pane_id === "string" ? event.data.pane_id : undefined;
     if (event.event === "pane.moved") {
-      const previous = typeof event.data.previous_pane_id === "string" ? event.data.previous_pane_id : paneId;
+      const previous =
+        typeof event.data.previous_pane_id === "string"
+          ? event.data.previous_pane_id
+          : paneId;
       const pane = event.data.pane;
       const next =
-        pane && typeof pane === "object" && !Array.isArray(pane) && typeof (pane as Record<string, unknown>).pane_id === "string"
+        pane &&
+        typeof pane === "object" &&
+        !Array.isArray(pane) &&
+        typeof (pane as Record<string, unknown>).pane_id === "string"
           ? String((pane as Record<string, unknown>).pane_id)
           : paneId;
       if (previous && next && previous !== next) {
@@ -379,12 +569,25 @@ export class Orchestrator {
         // Event payloads are wake signals. Query the current Herdr state before
         // acting so retained/replayed socket events cannot regress the fleet.
         const current = await this.runtime.get(run.herdrName);
-        this.updateState(run, current.status);
+        // Skip the save when nothing changed: redundant registry appends feed
+        // the fs.watch loop and amplify the very churn reconciliation handles.
+        if (current.status !== run.state) this.updateState(run, current.status);
         const pending = this.pending.get(run.id);
-        if (pending?.armed && run.state === "blocked") await this.notifyBlocked(run, pending);
-        else if (pending?.armed && isCompleted(run.state)) await this.finalize(run, pending);
+        if (pending?.armed && run.state === "blocked")
+          await this.notifyBlocked(run, pending);
+        else if (pending?.armed && isCompleted(run.state))
+          await this.finalize(run, pending);
       } catch (error) {
-        if (error instanceof HerdrCommandError && error.codeName === "not_found") {
+        if (
+          error instanceof HerdrCommandError &&
+          (error.codeName === "not_found" ||
+            error.codeName === "agent_not_found")
+        ) {
+          // A run still in `starting` may be mid-spawn (agent start takes up
+          // to 30s); do not kill it on the first not-found observation.
+          if (run.state === "starting" && Date.now() - run.startedAt < 30_000) {
+            return;
+          }
           run.state = "stopped";
           run.updatedAt = Date.now();
           this.pending.delete(run.id);
@@ -396,14 +599,17 @@ export class Orchestrator {
     try {
       await next;
     } finally {
-      if (this.reconcileLocks.get(run.id) === next) this.reconcileLocks.delete(run.id);
+      if (this.reconcileLocks.get(run.id) === next)
+        this.reconcileLocks.delete(run.id);
     }
   }
 
   private async finalize(run: AgentRun, pending: PendingTurn): Promise<void> {
     if (this.pending.get(run.id)?.generation !== pending.generation) return;
     this.pending.delete(run.id);
-    run.lastOutput = await this.runtime.read(run.herdrName, this.config.recentReadLines).catch(() => undefined);
+    run.lastOutput = await this.runtime
+      .read(run.herdrName, this.config.recentReadLines)
+      .catch(() => undefined);
     run.updatedAt = Date.now();
     this.save(run);
     if (!pending.notify || !this.config.notifyOnComplete) return;
@@ -424,11 +630,15 @@ export class Orchestrator {
     );
   }
 
-
-  private async notifyBlocked(run: AgentRun, pending?: PendingTurn): Promise<void> {
+  private async notifyBlocked(
+    run: AgentRun,
+    pending?: PendingTurn,
+  ): Promise<void> {
     if (pending?.blockedNotified) return;
     if (pending) pending.blockedNotified = true;
-    run.lastOutput = await this.runtime.read(run.herdrName, this.config.recentReadLines).catch(() => undefined);
+    run.lastOutput = await this.runtime
+      .read(run.herdrName, this.config.recentReadLines)
+      .catch(() => undefined);
     run.updatedAt = Date.now();
     this.save(run);
     const preview = (run.lastOutput ?? "(no readable output)").slice(-12_000);

@@ -29,7 +29,13 @@ export interface AgentMetadata {
 export interface AgentRuntime {
   readonly kind: "herdr";
   createLocation(options: CreateLocationOptions): Promise<RuntimeLocation>;
-  start(name: string, paneId: string, agentArgs: string[]): Promise<RuntimeAgentState>;
+  start(
+    name: string,
+    paneId: string,
+    agentArgs: string[],
+  ): Promise<RuntimeAgentState>;
+  closePane(paneId: string): Promise<void>;
+  paneExists(paneId: string): Promise<boolean>;
   prompt(name: string, text: string): Promise<RuntimeAgentState>;
   wait(name: string, timeoutMs?: number): Promise<RuntimeAgentState>;
   get(name: string): Promise<RuntimeAgentState>;

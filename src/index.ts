@@ -1,7 +1,13 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import { defineTool, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  defineTool,
+  getAgentDir,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents.js";
 import { loadConfig } from "./config.js";
 import { isHerdrAvailable } from "./herdr.js";
@@ -34,39 +40,92 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
   const config = loadConfig(cwd);
   const agents = discoverAgents(cwd);
   const group = process.env.PI_HERDR_FLEET_GROUP || makeGroupId();
-  const depth = Number.parseInt(process.env.PI_HERDR_FLEET_DEPTH || "0", 10) || 0;
+  const depth =
+    Number.parseInt(process.env.PI_HERDR_FLEET_DEPTH || "0", 10) || 0;
   const registryPath =
-    process.env.PI_HERDR_FLEET_REGISTRY || path.join(getAgentDir(), "herdr-fleet", `${group}.jsonl`);
+    process.env.PI_HERDR_FLEET_REGISTRY ||
+    path.join(getAgentDir(), "herdr-fleet", `${group}.jsonl`);
   const registry = new RunRegistry(registryPath, group);
   let activeCtx: ExtensionContext | undefined;
+
+  // The per-run prompt temp files are deleted right after the agent starts,
+  // but a hard crash between write and cleanup would leak one file per spawn.
+  // Spawns never take an hour, so anything older than that is crash residue.
+  const sweepStalePromptFiles = (): void => {
+    try {
+      const cutoff = Date.now() - 3_600_000;
+      for (const entry of fs.readdirSync(os.tmpdir())) {
+        if (!entry.startsWith("pi-herdr-fleet-prompt-")) continue;
+        const full = path.join(os.tmpdir(), entry);
+        try {
+          if (fs.statSync(full).mtimeMs < cutoff)
+            fs.rmSync(full, { force: true });
+        } catch {
+          // The file may already be gone.
+        }
+      }
+    } catch {
+      // tmpdir listing failures are non-fatal.
+    }
+  };
 
   const updateWidget = (): void => {
     const ctx = activeCtx;
     if (!ctx?.hasUI) return;
-    const runs = registry.all();
-    if (!runs.length) {
-      ctx.ui.setWidget("herdr-fleet", undefined);
-      return;
-    }
-    const active = runs.filter((r) => r.state === "starting" || r.state === "working").length;
-    const blocked = runs.filter((r) => r.state === "blocked").length;
-    const suffix = blocked ? ` · ${blocked} blocked` : "";
-    const socket = orchestrator.socketStatus();
-    const socketSuffix = socket === "connected" ? "" : ` · events:${socket}`;
-    const lines = [`Fleet agents · ${active} active${suffix}${socketSuffix} · depth ${depth}/${config.maxDepth}`];
-    for (const run of runs.slice(-8)) {
-      const thinking = run.thinking ? `:${run.thinking}` : "";
-      const wt = run.worktree ? " · wt" : "";
-      lines.push(
-        `${STATE_ICON[run.state]} ${run.name} (${run.role}) · ${modelLabel(run.model)}${thinking} · ${run.state}${wt}`,
+    try {
+      const runs = registry.all();
+      if (!runs.length) {
+        ctx.ui.setWidget("herdr-fleet", undefined);
+        return;
+      }
+      const active = runs.filter(
+        (r) => r.state === "starting" || r.state === "working",
+      ).length;
+      const blocked = runs.filter((r) => r.state === "blocked").length;
+      const suffix = blocked ? ` · ${blocked} blocked` : "";
+      const socket = orchestrator.socketStatus();
+      const socketSuffix = socket === "connected" ? "" : ` · events:${socket}`;
+      const lines = [
+        `Fleet agents · ${active} active${suffix}${socketSuffix} · depth ${depth}/${config.maxDepth}`,
+      ];
+      // Active runs always stay visible; settled runs are shown only from the
+      // most recent few so a long session cannot push live agents out of the
+      // widget or grow the list without bound.
+      const live = runs.filter(
+        (r) =>
+          r.state === "starting" ||
+          r.state === "working" ||
+          r.state === "blocked",
       );
+      const settled = runs.filter((r) => !live.includes(r)).slice(-4);
+      for (const run of [...live, ...settled].slice(0, 8)) {
+        const thinking = run.thinking ? `:${run.thinking}` : "";
+        const wt = run.worktree ? " · wt" : "";
+        lines.push(
+          `${STATE_ICON[run.state]} ${run.name} (${run.role}) · ${modelLabel(run.model)}${thinking} · ${run.state}${wt}`,
+        );
+      }
+      const overflow = runs.length - live.length - settled.length;
+      if (overflow > 0) lines.push(`… ${overflow} more`);
+      ctx.ui.setWidget("herdr-fleet", lines);
+    } catch {
+      // Widget updates are cosmetic. A UI failure must never propagate into
+      // socket or registry callbacks, where it would crash the agent process.
     }
-    if (runs.length > 8) lines.push(`… ${runs.length - 8} more`);
-    ctx.ui.setWidget("herdr-fleet", lines);
   };
 
   const runtime = new HerdrRuntime();
-  const orchestrator = new Orchestrator(pi, runtime, cwd, config, agents, registry, group, depth, updateWidget);
+  const orchestrator = new Orchestrator(
+    pi,
+    runtime,
+    cwd,
+    config,
+    agents,
+    registry,
+    group,
+    depth,
+    updateWidget,
+  );
 
   let registryWatcher: fs.FSWatcher | undefined;
   const onRegistryChanged = (): void => {
@@ -76,6 +135,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     activeCtx = ctx;
+    sweepStalePromptFiles();
     registryWatcher?.close();
     registryWatcher = fs.watch(registryPath, onRegistryChanged);
     updateWidget();
@@ -117,23 +177,51 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
       description:
         "Spawn an interactive Pi agent in a Herdr-managed sibling pane or explicit worktree. Model/thinking/tools come from the selected role. Returns after launch and prompt submission; lifecycle completion is event-driven.",
       parameters: Type.Object({
-        role: Type.String({ description: "Agent role, e.g. scout, planner, worker, reviewer" }),
+        role: Type.String({
+          description: "Agent role, e.g. scout, planner, worker, reviewer",
+        }),
         task: Type.String({ description: "Task/prompt for the agent" }),
-        name: Type.Optional(Type.String({ description: "Human-readable display name" })),
-        model: Type.Optional(Type.String({ description: "One-off model override (provider/model)" })),
-        thinking: Type.Optional(Type.String({ description: "off|minimal|low|medium|high|xhigh|max" })),
-        cwd: Type.Optional(Type.String({ description: "Working directory; defaults to the current project" })),
-        worktree: Type.Optional(
-          Type.Boolean({ description: "Explicitly isolate this agent in a Herdr Git worktree. Defaults to false unless configured by role." }),
+        name: Type.Optional(
+          Type.String({ description: "Human-readable display name" }),
         ),
-        direction: Type.Optional(Type.String({ description: "Optional sibling split direction: right or down. Otherwise chosen from pane geometry." })),
+        model: Type.Optional(
+          Type.String({
+            description: "One-off model override (provider/model)",
+          }),
+        ),
+        thinking: Type.Optional(
+          Type.String({ description: "off|minimal|low|medium|high|xhigh|max" }),
+        ),
+        cwd: Type.Optional(
+          Type.String({
+            description: "Working directory; defaults to the current project",
+          }),
+        ),
+        worktree: Type.Optional(
+          Type.Boolean({
+            description:
+              "Explicitly isolate this agent in a Herdr Git worktree. Defaults to false unless configured by role.",
+          }),
+        ),
+        direction: Type.Optional(
+          Type.String({
+            description:
+              "Optional sibling split direction: right or down. Otherwise chosen from pane geometry.",
+          }),
+        ),
         interactive: Type.Optional(
-          Type.Boolean({ description: "If true, suppress automatic caller wake-up when this turn settles" }),
+          Type.Boolean({
+            description:
+              "If true, suppress automatic caller wake-up when this turn settles",
+          }),
         ),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
         activeCtx = ctx;
-        const direction = params.direction === "right" || params.direction === "down" ? params.direction : undefined;
+        const direction =
+          params.direction === "right" || params.direction === "down"
+            ? params.direction
+            : undefined;
         const run = await orchestrator.spawn(
           {
             role: params.role,
@@ -229,7 +317,10 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
       async execute(_id, params, _signal, _onUpdate, ctx) {
         activeCtx = ctx;
         const text = await orchestrator.read(params.target, params.lines);
-        return { content: [{ type: "text", text: text || "(no output)" }], details: { target: params.target } };
+        return {
+          content: [{ type: "text", text: text || "(no output)" }],
+          details: { target: params.target },
+        };
       },
     }),
   );
@@ -238,13 +329,19 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
     defineTool({
       name: "agent_interrupt",
       label: "Interrupt Agent",
-      description: "Send Herdr's logical esc key to interrupt the current turn without destroying the pane/session.",
+      description:
+        "Send Herdr's logical esc key to interrupt the current turn without destroying the pane/session.",
       parameters: Type.Object({ target: Type.String() }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
         activeCtx = ctx;
         const run = await orchestrator.interrupt(params.target);
         return {
-          content: [{ type: "text", text: `Interrupted ${run.name} [${run.id}]. Current Herdr state: ${run.state}.` }],
+          content: [
+            {
+              type: "text",
+              text: `Interrupted ${run.name} [${run.id}]. Current Herdr state: ${run.state}.`,
+            },
+          ],
           details: run,
         };
       },
@@ -255,12 +352,18 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
     defineTool({
       name: "agent_focus",
       label: "Focus Agent",
-      description: "Focus a fleet agent in Herdr for direct human interaction. This may change done to idle because the work becomes seen.",
+      description:
+        "Focus a fleet agent in Herdr for direct human interaction. This may change done to idle because the work becomes seen.",
       parameters: Type.Object({ target: Type.String() }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
         activeCtx = ctx;
         const run = await orchestrator.focus(params.target);
-        return { content: [{ type: "text", text: `Focused ${run.name} [${run.id}] in Herdr.` }], details: run };
+        return {
+          content: [
+            { type: "text", text: `Focused ${run.name} [${run.id}] in Herdr.` },
+          ],
+          details: run,
+        };
       },
     }),
   );
@@ -269,7 +372,8 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
     defineTool({
       name: "agent_list",
       label: "List Agents",
-      description: "List every known agent in the shared fleet, including peers spawned by child agents.",
+      description:
+        "List every known agent in the shared fleet, including peers spawned by child agents.",
       parameters: Type.Object({}),
       async execute(_id, _params, _signal, _onUpdate, ctx) {
         activeCtx = ctx;
@@ -298,7 +402,10 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
         `registry=${registryPath}`,
         `events=${orchestrator.socketStatus()}`,
         `roles=${agents.map((a) => a.name).join(", ") || "none"}`,
-        ...runs.map((r) => `${STATE_ICON[r.state]} ${r.id} ${r.name} (${r.role}) ${r.state} ${r.herdrName} ${r.paneId}`),
+        ...runs.map(
+          (r) =>
+            `${STATE_ICON[r.state]} ${r.id} ${r.name} (${r.role}) ${r.state} ${r.herdrName} ${r.paneId}`,
+        ),
       ];
       ctx.ui.notify(lines.join("\n"), "info");
       updateWidget();

@@ -33,14 +33,20 @@ function sameSet(a: Set<string>, b: Set<string>): boolean {
   return true;
 }
 
-export function decodeHerdrSocketEvent(message: Record<string, unknown>): Omit<HerdrSocketEvent, "receivedAt"> | undefined {
+export function decodeHerdrSocketEvent(
+  message: Record<string, unknown>,
+): Omit<HerdrSocketEvent, "receivedAt"> | undefined {
   const event = normalizeHerdrEventName(message.event ?? message.type);
   if (!event) return undefined;
   const rawData = message.data;
   const data =
     rawData && typeof rawData === "object" && !Array.isArray(rawData)
       ? (rawData as Record<string, unknown>)
-      : Object.fromEntries(Object.entries(message).filter(([key]) => key !== "id" && key !== "event" && key !== "type"));
+      : Object.fromEntries(
+          Object.entries(message).filter(
+            ([key]) => key !== "id" && key !== "event" && key !== "type",
+          ),
+        );
   return { event, data };
 }
 
@@ -52,6 +58,7 @@ export class HerdrEventSubscriber {
   private generation = 0;
   private reconnectDelayMs = 250;
   private connected = false;
+  private connecting = false;
   private reconfigure: Promise<void> = Promise.resolve();
 
   constructor(
@@ -60,9 +67,21 @@ export class HerdrEventSubscriber {
     private readonly onError: ErrorHandler = () => {},
   ) {}
 
+  private guardError(error: unknown): void {
+    // onError runs inside socket event handlers and fire-and-forget promise
+    // chains; letting it throw (or reject) would crash the host process.
+    try {
+      this.onError(error instanceof Error ? error : new Error(String(error)));
+    } catch {
+      // Swallow: a throwing error handler must not kill the agent.
+    }
+  }
+
   start(): Promise<void> {
     this.running = true;
-    this.reconfigure = this.reconfigure.catch(() => undefined).then(() => this.reconnect());
+    this.reconfigure = this.reconfigure
+      .catch(() => undefined)
+      .then(() => this.reconnect());
     return this.reconfigure;
   }
 
@@ -79,8 +98,26 @@ export class HerdrEventSubscriber {
     const changed = !sameSet(this.panes, next);
     this.panes = next;
     if (!this.running) return Promise.resolve();
-    if (!changed && this.connected) return this.reconfigure;
-    this.reconfigure = this.reconfigure.catch(() => undefined).then(() => this.reconnect());
+    // While a connection attempt is in flight, additional ensurePanes calls
+    // (registry watcher fires on every save) must be no-ops. Chaining another
+    // reconnect destroys the in-flight socket before the handshake completes,
+    // which wedges `connected=false` forever and storms the server.
+    if (!changed && (this.connected || this.connecting))
+      return this.reconfigure;
+    if (this.connecting) return this.reconfigure;
+    this.connecting = true;
+    this.reconfigure = this.reconfigure
+      .catch(() => undefined)
+      .then(() => this.reconnect())
+      .catch((error) => {
+        // Sync callers (registry watcher, socket events) fire-and-forget this
+        // promise; a failed reconfiguration must surface as onError, not as an
+        // unhandled rejection that crashes the process.
+        this.guardError(error);
+      })
+      .finally(() => {
+        this.connecting = false;
+      });
     return this.reconfigure;
   }
 
@@ -88,7 +125,9 @@ export class HerdrEventSubscriber {
     if (!this.running) return;
     const socketPath = getHerdrSocketPath();
     if (!socketPath) {
-      throw new Error("HERDR_SOCKET_PATH is not set; Herdr socket event subscriptions are unavailable.");
+      throw new Error(
+        "HERDR_SOCKET_PATH is not set; Herdr socket event subscriptions are unavailable.",
+      );
     }
 
     const generation = ++this.generation;
@@ -103,9 +142,18 @@ export class HerdrEventSubscriber {
       const requestId = `pi_mesh_${process.pid}_${generation}`;
 
       const failBeforeReady = (error: Error): void => {
+        clearTimeout(handshakeTimeout);
         if (!acknowledged) reject(error);
-        this.onError(error);
+        this.guardError(error);
       };
+
+      // A wedged handshake must not hold the reconfigure chain forever.
+      const handshakeTimeout = setTimeout(() => {
+        failBeforeReady(
+          new Error("Herdr event subscription handshake timed out."),
+        );
+        socket.destroy();
+      }, 10_000);
 
       socket.setEncoding("utf8");
       socket.on("connect", () => {
@@ -113,9 +161,14 @@ export class HerdrEventSubscriber {
           { type: "pane.exited" },
           { type: "pane.closed" },
           { type: "pane.moved" },
-          ...[...this.panes].map((paneId) => ({ type: "pane.agent_status_changed", pane_id: paneId })),
+          ...[...this.panes].map((paneId) => ({
+            type: "pane.agent_status_changed",
+            pane_id: paneId,
+          })),
         ];
-        socket.write(`${JSON.stringify({ id: requestId, method: "events.subscribe", params: { subscriptions } })}\n`);
+        socket.write(
+          `${JSON.stringify({ id: requestId, method: "events.subscribe", params: { subscriptions } })}\n`,
+        );
       });
 
       socket.on("data", (chunk: string) => {
@@ -136,13 +189,16 @@ export class HerdrEventSubscriber {
 
           if (message.id === requestId) {
             if (message.error) {
-              const error = new Error(`Herdr events.subscribe failed: ${JSON.stringify(message.error)}`);
+              const error = new Error(
+                `Herdr events.subscribe failed: ${JSON.stringify(message.error)}`,
+              );
               failBeforeReady(error);
               socket.destroy();
               return;
             }
             if (!acknowledged) {
               acknowledged = true;
+              clearTimeout(handshakeTimeout);
               this.connected = true;
               this.reconnectDelayMs = 250;
               resolve();
@@ -153,22 +209,42 @@ export class HerdrEventSubscriber {
 
           const decoded = decodeHerdrSocketEvent(message);
           if (!decoded) continue;
-          void this.onEvent({ ...decoded, receivedAt: Date.now() });
+          void Promise.resolve()
+            .then(() => this.onEvent({ ...decoded, receivedAt: Date.now() }))
+            .catch((error) => this.guardError(error));
         }
       });
 
-      socket.on("error", (error) => failBeforeReady(error));
+      socket.on("error", (error) => {
+        try {
+          failBeforeReady(error);
+        } catch (guarded) {
+          this.guardError(guarded);
+        }
+      });
       socket.on("close", () => {
-        if (generation !== this.generation || !this.running) return;
-        this.connected = false;
-        if (!acknowledged) reject(new Error("Herdr event socket closed before subscription acknowledgement."));
-        else this.onError(new Error("Herdr event socket disconnected; reconnecting."));
-        const delay = this.reconnectDelayMs;
-        this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 5000);
-        setTimeout(() => {
-          if (!this.running || generation !== this.generation) return;
-          void this.reconnect().catch((error) => this.onError(error instanceof Error ? error : new Error(String(error))));
-        }, delay);
+        try {
+          if (generation !== this.generation || !this.running) return;
+          this.connected = false;
+          if (!acknowledged)
+            reject(
+              new Error(
+                "Herdr event socket closed before subscription acknowledgement.",
+              ),
+            );
+          else
+            this.guardError(
+              new Error("Herdr event socket disconnected; reconnecting."),
+            );
+          const delay = this.reconnectDelayMs;
+          this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 5000);
+          setTimeout(() => {
+            if (!this.running || generation !== this.generation) return;
+            void this.reconnect().catch((error) => this.guardError(error));
+          }, delay);
+        } catch (guarded) {
+          this.guardError(guarded);
+        }
       });
     });
   }
