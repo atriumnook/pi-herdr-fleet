@@ -183,7 +183,7 @@ export class Orchestrator {
       if (!(await this.paneGone(run.paneId))) continue;
       run.state = "stopped";
       run.updatedAt = Date.now();
-      this.pending.delete(run.id);
+      this.dropPending(run.id);
       this.save(run);
     }
   }
@@ -442,6 +442,7 @@ export class Orchestrator {
     text: string,
     notify: boolean,
   ): Promise<AgentRun> {
+    this.clearSettleCheck(run.id);
     const generation = (this.generations.get(run.id) ?? 0) + 1;
     this.generations.set(run.id, generation);
     const pending: PendingTurn = { notify, armed: false, generation };
@@ -469,6 +470,7 @@ export class Orchestrator {
           : submitted.status,
       );
       pending.armed = true;
+      this.clearSettleCheck(run.id);
       if (submitted.status !== "working") {
         // An extremely fast turn can settle while the prompt command is still
         // in flight, or settle before the TUI ever flips to working; in both
@@ -476,9 +478,15 @@ export class Orchestrator {
         // "working" forever. Verify after a short grace period — verifying
         // immediately would mistake pre-visual idle for a settled turn: if the
         // agent already settled, finalize; if it is working, events take over.
+        // The timer is keyed by pending.generation so a follow-up agent_send
+        // cannot inherit an older grace period and treat pre-visual idle as
+        // completion of the new turn.
+        const generation = pending.generation;
         const timer = setTimeout(() => {
           this.settleChecks.delete(run.id);
-          if (this.pending.has(run.id)) void this.reconcileRun(run);
+          if (this.pending.get(run.id)?.generation === generation) {
+            void this.reconcileRun(run);
+          }
         }, 2_500);
         this.settleChecks.set(run.id, timer);
       }
@@ -491,7 +499,7 @@ export class Orchestrator {
         // Herdr rejected the prompt before sending input. Do not retain this as
         // an in-flight turn; surface the blocker and let the caller retry after
         // the human resolves it.
-        this.pending.delete(run.id);
+        this.dropPending(run.id);
         this.updateState(run, "blocked");
         run.lastOutput = await this.runtime
           .read(run.herdrName, this.config.recentReadLines)
@@ -500,7 +508,7 @@ export class Orchestrator {
         this.save(run);
         return run;
       }
-      this.pending.delete(run.id);
+      this.dropPending(run.id);
       run.state = "failed";
       run.lastError = error instanceof Error ? error.message : String(error);
       run.updatedAt = Date.now();
@@ -545,7 +553,7 @@ export class Orchestrator {
     if (event.event === "pane.exited" || event.event === "pane.closed") {
       run.state = "stopped";
       run.updatedAt = Date.now();
-      this.pending.delete(run.id);
+      this.dropPending(run.id);
       this.save(run);
       await this.syncEvents();
       return;
@@ -590,7 +598,7 @@ export class Orchestrator {
           }
           run.state = "stopped";
           run.updatedAt = Date.now();
-          this.pending.delete(run.id);
+          this.dropPending(run.id);
           this.save(run);
         }
       }
@@ -604,9 +612,21 @@ export class Orchestrator {
     }
   }
 
+  private clearSettleCheck(runId: string): void {
+    const timer = this.settleChecks.get(runId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.settleChecks.delete(runId);
+  }
+
+  private dropPending(runId: string): void {
+    this.pending.delete(runId);
+    this.clearSettleCheck(runId);
+  }
+
   private async finalize(run: AgentRun, pending: PendingTurn): Promise<void> {
     if (this.pending.get(run.id)?.generation !== pending.generation) return;
-    this.pending.delete(run.id);
+    this.dropPending(run.id);
     run.lastOutput = await this.runtime
       .read(run.herdrName, this.config.recentReadLines)
       .catch(() => undefined);
