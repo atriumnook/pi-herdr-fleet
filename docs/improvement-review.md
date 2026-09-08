@@ -49,6 +49,7 @@
 - **Where:** `src/orchestrator.ts` `syncEvents()`（`if (this.syncInFlight) return this.syncInFlight`）
 - **Why:** registry の `fs.watch`（`src/index.ts` `onRegistryChanged`）が書き込みのたびに同期する。進行中の sync に合流すると、その sync が既に `list()` した後に追加された pane は購読されない。同一プロセスの spawn は後段の `submit` → `ensurePanes` で回収できるが、子 agent（別プロセス）が registry に足した peer は、次の書き込みまで status イベントを取りこぼす。
 - **Direction:** in-flight 中は dirty フラグを立て、完了後にもう一度 `prune + ensurePanes` する trailing-edge。合流した caller はその follow-up まで待つ。再接続ストームを戻さないこと（`ensurePanes` の `connecting` ガードは維持）。
+- **Status:** この PR で `syncQueued` + while ループを入れた。`syncInFlight` は raw run promise を保持し、finally で identity 照合してクリアする（`.finally()` ラップへ `.then(() => syncEvents())` を繋ぐとマイクロタスク無限ループになるため）。orchestrator テストで mid-sync の pane 追加を固定。
 
 ### 3. イベント購読の `connecting` ガードが `start()` / `close` 再接続をカバーしていない
 
@@ -62,6 +63,7 @@
   2. handshake 完了後、購読した集合と `this.panes` が違えば follow-up reconnect
   3. `close` の自動 reconnect も `reconfigure` チェーンに乗せる（generation チェックは残す）
   ソケットをモックした単体テストが一番安い。
+- **Status:** この PR で `enqueueReconnect` / `panesDirty` / handshake dirty ループを入れ、`start()` と socket `close` も同じゲートに乗せた。`test/herdr-events-subscriber.test.ts` で Unix socket モック。
 
 ### 4. ライフサイクル修正に回帰テストがほぼ無い
 
@@ -72,7 +74,7 @@
   2. registry: `lastOutput` 切り詰め、増分パース、壊れた 1 行を飛ばすこと
   3. `AgentRuntime` をフェイクして spawn gate / settle timer / prune の数本
   4. `bun run check` を GitHub Actions で main/PR に乗せる
-- **Status:** この PR で 1–4 を追加した（`test/agents.test.ts`、`test/registry.test.ts`、`test/orchestrator.test.ts`、`.github/workflows/ci.yml`）。subscriber のソケットモックは未着手。
+- **Status:** この PR で 1–4 を追加した（`test/agents.test.ts`、`test/registry.test.ts`、`test/orchestrator.test.ts`、`.github/workflows/ci.yml`）。subscriber のソケットモックは `test/herdr-events-subscriber.test.ts` で追加。
 
 ### 5. 失敗が沈黙する
 
@@ -119,6 +121,6 @@
 ## 推奨する次の一手（短い順）
 
 1. ~~項目 4 の bundled-agent / registry 回帰テストと `bun run check` の CI~~ **済み**（この PR）
-2. 項目 2 の trailing sync と項目 3 の subscriber ゲート（残っているイベント穴）
+2. ~~項目 2 の trailing sync と項目 3 の subscriber ゲート~~ **済み**（この PR）
 3. 項目 5 の警告（サポートコストを減らす）
 4. 項目 6 の wait timeout / abort（固着ターンの防止）

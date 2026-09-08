@@ -7,6 +7,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { HerdrCommandError } from "../src/herdr.js";
+import { HerdrEventSubscriber } from "../src/herdr-events.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { RunRegistry } from "../src/registry.js";
 import type {
@@ -345,6 +346,79 @@ describe("orchestrator lifecycle", () => {
     await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
     expect(registry.byPane("w1:new")?.state).toBe("starting");
   });
+
+  test(
+    "trailing-edge syncEvents subscribes to a pane added mid-sync",
+    async () => {
+      const { orch, registry } = makeHarness();
+      registry.upsert({
+        id: "pane-a",
+        name: "Scout",
+        role: "scout",
+        herdrName: "fleet-scout-a",
+        paneId: "w1:a",
+        cwd: "/tmp/repo",
+        state: "working",
+        depth: 1,
+        interactive: false,
+        worktree: false,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      delete process.env.HERDR_SOCKET_PATH;
+      await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+
+      const seen: string[][] = [];
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let enteredFirst = false;
+      const original = HerdrEventSubscriber.prototype.ensurePanes;
+      HerdrEventSubscriber.prototype.ensurePanes = async function (paneIds) {
+        const list = [...paneIds];
+        seen.push(list);
+        if (seen.length === 1) {
+          enteredFirst = true;
+          await firstGate;
+        }
+      };
+      try {
+        const first = orch.syncEvents();
+        const deadline = Date.now() + 1_000;
+        while (!enteredFirst && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        expect(enteredFirst).toBe(true);
+        expect(seen[0]).toEqual(["w1:a"]);
+
+        registry.upsert({
+          id: "pane-b",
+          name: "Scout",
+          role: "scout",
+          herdrName: "fleet-scout-b",
+          paneId: "w1:b",
+          cwd: "/tmp/repo",
+          state: "working",
+          depth: 1,
+          interactive: false,
+          worktree: false,
+          startedAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+        const second = orch.syncEvents();
+        releaseFirst();
+        await Promise.all([first, second]);
+
+        expect(seen.length).toBeGreaterThanOrEqual(2);
+        expect(seen.some((list) => list.includes("w1:b"))).toBe(true);
+        expect(seen.at(-1)?.slice().sort()).toEqual(["w1:a", "w1:b"]);
+      } finally {
+        HerdrEventSubscriber.prototype.ensurePanes = original;
+      }
+    },
+    3_000,
+  );
 
   test("surfaces agent_blocked without keeping an in-flight turn", async () => {
     const { orch, runtime } = makeHarness();

@@ -83,6 +83,7 @@ export class Orchestrator {
   >();
   private spawnGate: Promise<void> = Promise.resolve();
   private syncInFlight?: Promise<void>;
+  private syncQueued = false;
   private eventsStarted = false;
   private eventState: "connecting" | "connected" | "reconnecting" | "stopped" =
     "stopped";
@@ -143,6 +144,7 @@ export class Orchestrator {
 
   stopEvents(): void {
     this.eventsStarted = false;
+    this.syncQueued = false;
     this.eventState = "stopped";
     for (const timer of this.settleChecks.values()) clearTimeout(timer);
     this.settleChecks.clear();
@@ -152,20 +154,35 @@ export class Orchestrator {
 
   async syncEvents(): Promise<void> {
     if (!this.eventsStarted) return;
-    // Registry writes fire the watcher on every save; coalesce overlapping
-    // syncs so a write burst cannot pile up herdr CLI round-trips.
-    if (this.syncInFlight) return this.syncInFlight;
-    this.syncInFlight = (async () => {
-      await this.pruneOrphanRuns();
-      await this.events.ensurePanes(
-        this.list()
-          .filter(isLive)
-          .map((run) => run.paneId),
-      );
-    })().finally(() => {
-      this.syncInFlight = undefined;
+    // Registry writes fire the watcher on every save. An in-flight sync that
+    // already snapshotted list() would otherwise drop panes a child process
+    // just appended; mark dirty and loop so the coalesced callers wait for
+    // the trailing prune + ensurePanes.
+    if (this.syncInFlight) {
+      this.syncQueued = true;
+      return this.syncInFlight;
+    }
+    // Store the raw run promise — not a .finally() wrapper. Chaining
+    // `syncInFlight.then(() => this.syncEvents())` onto a finally-wrapped
+    // promise turns into a microtask loop: finally clears the slot, the
+    // then starts another sync, and tests hang.
+    const run = (async () => {
+      do {
+        this.syncQueued = false;
+        if (!this.eventsStarted) break;
+        await this.pruneOrphanRuns();
+        await this.events.ensurePanes(
+          this.list()
+            .filter(isLive)
+            .map((item) => item.paneId),
+        );
+      } while (this.syncQueued);
+    })();
+    this.syncInFlight = run;
+    void run.finally(() => {
+      if (this.syncInFlight === run) this.syncInFlight = undefined;
     });
-    return this.syncInFlight;
+    return run;
   }
 
   /**
