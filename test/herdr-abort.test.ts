@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { abortError, isAbortError } from "../src/herdr.js";
+import { abortableDelay, abortError, isAbortError } from "../src/herdr.js";
 
 describe("abort helpers", () => {
   test("detects AbortError by name or ABORT_ERR code", () => {
@@ -24,5 +24,12 @@ describe("abort helpers", () => {
     const plain = abortError();
     expect(plain.name).toBe("AbortError");
     expect(isAbortError(plain)).toBe(true);
+  });
+
+  test("abortableDelay rejects when the signal fires", async () => {
+    const controller = new AbortController();
+    const pending = abortableDelay(5_000, controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 });

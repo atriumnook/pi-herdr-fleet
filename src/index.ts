@@ -244,7 +244,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
           }),
         ),
       }),
-      async execute(_id, params, _signal, _onUpdate, ctx) {
+      async execute(_id, params, signal, _onUpdate, ctx) {
         activeCtx = ctx;
         const direction =
           params.direction === "right" || params.direction === "down"
@@ -263,6 +263,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
             interactive: params.interactive,
           },
           ctx,
+          signal,
         );
         return {
           content: [
@@ -290,9 +291,13 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
         target: Type.String(),
         message: Type.String(),
       }),
-      async execute(_id, params, _signal, _onUpdate, ctx) {
+      async execute(_id, params, signal, _onUpdate, ctx) {
         activeCtx = ctx;
-        const run = await orchestrator.send(params.target, params.message);
+        const run = await orchestrator.send(
+          params.target,
+          params.message,
+          signal,
+        );
         return {
           content: [
             {

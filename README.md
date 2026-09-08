@@ -111,9 +111,9 @@ Worktree isolation is opt-in and can be enabled per role or spawn.
 
 | Tool | Purpose |
 | --- | --- |
-| `agent_spawn` | Start a Pi agent in a Herdr pane |
-| `agent_send` | Send a message to another fleet member |
-| `agent_wait` | Wait for an agent explicitly |
+| `agent_spawn` | Start a Pi agent in a Herdr pane. Honors tool cancellation (`AbortSignal`); a cancelled spawn closes the new pane. |
+| `agent_send` | Send a message to another fleet member. Honors `AbortSignal` without closing the existing pane. |
+| `agent_wait` | Wait for an agent explicitly. Honors `AbortSignal` and a default timeout. |
 | `agent_read` | Read recent output without changing focus |
 | `agent_interrupt` | Interrupt the current turn |
 | `agent_focus` | Focus an agent pane for manual interaction |

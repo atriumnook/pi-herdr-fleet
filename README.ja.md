@@ -111,9 +111,9 @@ worktree isolation は opt-in で、role または spawn ごとに有効化で�
 
 | Tool | 用途 |
 | --- | --- |
-| `agent_spawn` | Pi agent を Herdr pane で起動 |
-| `agent_send` | fleet member にメッセージを送信 |
-| `agent_wait` | agent を明示的に待機 |
+| `agent_spawn` | Pi agent を Herdr pane で起動。ツールキャンセル（`AbortSignal`）に応じ、中断時は新規 pane を閉じる。 |
+| `agent_send` | fleet member にメッセージを送信。`AbortSignal` に応じるが既存 pane は閉じない。 |
+| `agent_wait` | agent を明示的に待機。`AbortSignal` とデフォルト timeout に応じる。 |
 | `agent_read` | focus を変えず最近の出力を取得 |
 | `agent_interrupt` | 現在の turn を interrupt |
 | `agent_focus` | agent pane に focus して直接操作 |

@@ -91,7 +91,7 @@
 - **Where:** `src/index.ts` の各 `execute(..., _signal, ...)`、`src/orchestrator.ts` `wait()`、`src/runtime-herdr.ts` `wait()`（timeout 省略可）
 - **Why:** Herdr の `agent wait` はデフォルト timeout なし。モデルが `timeout_ms` を付け忘れるとターンが固まる。Pi がツールをキャンセルしても `_signal` 未使用なので CLI は生き残る。
 - **Direction:** `agent_wait` に設定可能なデフォルト（例: 120s）を足す。`signal` で `herdr` 子プロセスを kill するか、少なくとも wait を abort。`spawn`/`prompt` は最初は wait だけでよい。
-- **Status:** この PR で追加。`defaultWaitTimeoutMs` デフォルト 120000。`timeout_ms` 省略時はこれを Herdr `--timeout` に渡す。AbortSignal は `agent_wait` → `herdr` CLI（`execFile` の `signal` で子プロセスを kill）。timeout は `AgentWaitTimeoutError` として現在状態を返す。spawn/prompt は未対応。
+- **Status:** この PR で追加。`defaultWaitTimeoutMs` デフォルト 120000。`timeout_ms` 省略時はこれを Herdr `--timeout` に渡す。AbortSignal は `agent_wait` / `agent_spawn` / `agent_send` → `herdr` CLI（`execFile` の `signal` で子プロセスを kill）。timeout は `AgentWaitTimeoutError` として現在状態を返す。spawn 中断時は作った pane を close する。send 中断では既存 pane は残す。
 
 ## P2 — あるとよい
 
@@ -128,11 +128,11 @@
 1. ~~項目 4 の bundled-agent / registry 回帰テストと `bun run check` の CI~~ **済み**（この PR）
 2. ~~項目 2 の trailing sync と項目 3 の subscriber ゲート~~ **済み**（この PR）
 3. ~~項目 5 の警告~~ **済み**（この PR）
-4. ~~項目 6 の wait timeout / abort~~ **済み**（この PR）
+4. ~~項目 6 の wait / spawn / prompt timeout / abort~~ **済み**（この PR）
 5. ~~項目 7 の JSONL / PIPE_BUF~~ **済み**（この PR）。compaction / rewind も済み。
 6. ~~項目 8 の完了 pane 回収 / `closeOnSettle` / `/fleet close` / blocked 単体~~ **済み**（この PR）
 7. ~~項目 9 の設定 DX（example / README）と spawn 時 thinking 拒否~~ **済み**（この PR）
 
-このレビューの P0–P2 ドキュメント項目は一通り入れた。残るのは後回しにした実装:
+このレビューの P0–P2 項目と後回し実装（JSONL rewind、closeOnSettle、`/fleet close`、thinking 拒否、spawn/prompt abort）は一通り入れた。
 
-- `spawn` / `prompt` の AbortSignal（項目 6、wait 以外）
+残リスク: pane split が CLI kill より先に完了して pane_id を受け取れない場合、Herdr 側に空 pane が残ることがある。worktree spawn 中断では pane は閉じるが、worktree ディレクトリ自体は回収しない。

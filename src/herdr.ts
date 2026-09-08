@@ -120,3 +120,23 @@ export function abortError(signal?: AbortSignal): Error {
   (error as Error & { code: string }).code = "ABORT_ERR";
   return error;
 }
+
+export function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError(signal));
+  if (!signal) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortError(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}

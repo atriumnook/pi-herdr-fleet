@@ -6,7 +6,11 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { HerdrCommandError } from "../src/herdr.js";
+import {
+  abortableDelay,
+  abortError,
+  HerdrCommandError,
+} from "../src/herdr.js";
 import { HerdrEventSubscriber } from "../src/herdr-events.js";
 import { Orchestrator, AgentWaitTimeoutError } from "../src/orchestrator.js";
 import { RunRegistry } from "../src/registry.js";
@@ -39,18 +43,19 @@ class FakeRuntime implements AgentRuntime {
   getStatus: AgentState = "working";
   startImpl?: AgentRuntime["start"];
   waitImpl?: AgentRuntime["wait"];
+  promptImpl?: AgentRuntime["prompt"];
   getImpl?: AgentRuntime["get"];
   paneExistsImpl?: (paneId: string) => Promise<boolean>;
   private locations = 0;
 
   async createLocation(
     options: CreateLocationOptions,
+    signal?: AbortSignal,
   ): Promise<RuntimeLocation> {
     if (this.createLocationDelayMs > 0) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, this.createLocationDelayMs),
-      );
+      await abortableDelay(this.createLocationDelayMs, signal);
     }
+    if (signal?.aborted) throw abortError(signal);
     this.locations += 1;
     return { paneId: `w1:p${this.locations}`, cwd: options.cwd };
   }
@@ -59,9 +64,11 @@ class FakeRuntime implements AgentRuntime {
     name: string,
     paneId: string,
     agentArgs: string[],
+    signal?: AbortSignal,
   ): Promise<RuntimeAgentState> {
     this.startCalls.push({ name, paneId, agentArgs });
-    if (this.startImpl) return this.startImpl(name, paneId, agentArgs);
+    if (this.startImpl) return this.startImpl(name, paneId, agentArgs, signal);
+    if (signal?.aborted) throw abortError(signal);
     return { status: "idle" };
   }
 
@@ -74,7 +81,13 @@ class FakeRuntime implements AgentRuntime {
     return true;
   }
 
-  async prompt(name: string, text: string): Promise<RuntimeAgentState> {
+  async prompt(
+    name: string,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<RuntimeAgentState> {
+    if (this.promptImpl) return this.promptImpl(name, text, signal);
+    if (signal?.aborted) throw abortError(signal);
     this.prompts.push({ name, text });
     return { status: this.promptStatus };
   }
@@ -772,6 +785,76 @@ describe("orchestrator lifecycle", () => {
     await entered;
     controller.abort();
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  test("spawn aborts during pane creation without leaving a run", async () => {
+    const { orch, runtime } = makeHarness();
+    runtime.createLocationDelayMs = 5_000;
+    const controller = new AbortController();
+    const pending = orch.spawn(
+      { role: "scout", task: "go" },
+      fakeCtx(),
+      controller.signal,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(orch.list()).toEqual([]);
+    expect(runtime.closed).toEqual([]);
+  });
+
+  test("spawn aborts during agent start and closes the pane", async () => {
+    const { orch, runtime } = makeHarness();
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    runtime.startImpl = async (_name, _paneId, _args, signal) => {
+      release();
+      await abortableDelay(5_000, signal);
+      return { status: "idle" };
+    };
+    const controller = new AbortController();
+    const pending = orch.spawn(
+      { role: "scout", task: "go" },
+      fakeCtx(),
+      controller.signal,
+    );
+    await entered;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(runtime.closed).toEqual(["w1:p1"]);
+    expect(orch.list()[0]?.state).toBe("stopped");
+    expect(orch.list()[0]?.lastError).toMatch(/cancelled/);
+  });
+
+  test("send aborts during prompt without closing the existing pane", async () => {
+    const { orch, runtime } = makeHarness({ closeOnSettle: false });
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    expect(runtime.closed).toEqual([]);
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    runtime.promptImpl = async (_name, _text, signal) => {
+      release();
+      await abortableDelay(5_000, signal);
+      return { status: "working" };
+    };
+    const controller = new AbortController();
+    const pending = orch.send(run.id, "follow up", controller.signal);
+    await entered;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(runtime.closed).toEqual([]);
+    expect(orch.list()[0]?.state).not.toBe("failed");
+    runtime.promptImpl = undefined;
+    const again = await orch.send(run.id, "retry");
+    expect(again.state).toBe("working");
+    expect(runtime.prompts.at(-1)).toEqual({
+      name: run.herdrName,
+      text: "retry",
+    });
   });
 
   test("closeOnSettle closes a non-interactive pane when wait sees settlement", async () => {

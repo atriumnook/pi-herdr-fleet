@@ -1,8 +1,11 @@
 import {
+  abortableDelay,
+  abortError,
   assertHerdr,
   HerdrCommandError,
   herdrJson,
   herdrText,
+  isAbortError,
 } from "./herdr.js";
 import type {
   AgentMetadata,
@@ -119,86 +122,114 @@ export class HerdrRuntime implements AgentRuntime {
 
   async createLocation(
     options: CreateLocationOptions,
+    signal?: AbortSignal,
   ): Promise<RuntimeLocation> {
-    if (options.worktree) {
-      if (!options.branch)
-        throw new Error("Herdr worktree runtime requires a branch name.");
-      const created = await herdrJson<WorktreeCreateResult>([
-        "worktree",
-        "create",
-        "--cwd",
-        options.cwd,
-        "--branch",
-        options.branch,
-        "--label",
-        options.label,
-        "--no-focus",
-      ]);
-      const rootPaneId = created.result?.root_pane?.pane_id;
-      if (!rootPaneId)
-        throw new Error(
-          "Herdr worktree create did not return result.root_pane.pane_id.",
+    if (signal?.aborted) throw abortError(signal);
+    const leftover: string[] = [];
+    try {
+      if (options.worktree) {
+        if (!options.branch)
+          throw new Error("Herdr worktree runtime requires a branch name.");
+        const created = await herdrJson<WorktreeCreateResult>(
+          [
+            "worktree",
+            "create",
+            "--cwd",
+            options.cwd,
+            "--branch",
+            options.branch,
+            "--label",
+            options.label,
+            "--no-focus",
+          ],
+          signal,
         );
-      const cwd = created.result?.worktree?.path ?? options.cwd;
+        const rootPaneId = created.result?.root_pane?.pane_id;
+        if (!rootPaneId)
+          throw new Error(
+            "Herdr worktree create did not return result.root_pane.pane_id.",
+          );
+        leftover.push(rootPaneId);
+        const cwd = created.result?.worktree?.path ?? options.cwd;
 
-      // worktree.create does not expose --env. Create the actual agent pane with
-      // pane split --env and remove the temporary empty root pane. This keeps
-      // fleet context injection cross-shell and cross-platform.
-      const split = await herdrJson<PaneSplitResult>([
-        "pane",
-        "split",
-        rootPaneId,
-        "--direction",
-        await this.chooseSplitDirection(rootPaneId),
-        "--cwd",
-        cwd,
-        ...envArgs(options.env),
-        "--no-focus",
-      ]);
+        // worktree.create does not expose --env. Create the actual agent pane with
+        // pane split --env and remove the temporary empty root pane. This keeps
+        // fleet context injection cross-shell and cross-platform.
+        const split = await herdrJson<PaneSplitResult>(
+          [
+            "pane",
+            "split",
+            rootPaneId,
+            "--direction",
+            await this.chooseSplitDirection(rootPaneId, signal),
+            "--cwd",
+            cwd,
+            ...envArgs(options.env),
+            "--no-focus",
+          ],
+          signal,
+        );
+        const paneId = split.result?.pane?.pane_id;
+        if (!paneId)
+          throw new Error(
+            "Herdr worktree agent pane split did not return result.pane.pane_id.",
+          );
+        leftover.push(paneId);
+        await herdrJson(["pane", "close", rootPaneId], signal);
+        leftover.splice(leftover.indexOf(rootPaneId), 1);
+        return {
+          paneId,
+          workspaceId:
+            created.result?.workspace?.workspace_id ??
+            created.result?.workspace?.id,
+          cwd,
+        };
+      }
+
+      const callerPane = process.env.HERDR_PANE_ID;
+      if (!callerPane)
+        throw new Error(
+          "HERDR_PANE_ID is required to create a sibling agent pane.",
+        );
+      const direction =
+        options.direction ??
+        (await this.chooseSplitDirection(callerPane, signal));
+      const split = await herdrJson<PaneSplitResult>(
+        [
+          "pane",
+          "split",
+          callerPane,
+          "--direction",
+          direction,
+          "--cwd",
+          options.cwd,
+          ...envArgs(options.env),
+          "--no-focus",
+        ],
+        signal,
+      );
       const paneId = split.result?.pane?.pane_id;
       if (!paneId)
-        throw new Error(
-          "Herdr worktree agent pane split did not return result.pane.pane_id.",
-        );
-      await herdrJson(["pane", "close", rootPaneId]);
-      return {
-        paneId,
-        workspaceId:
-          created.result?.workspace?.workspace_id ??
-          created.result?.workspace?.id,
-        cwd,
-      };
+        throw new Error("Herdr pane split did not return result.pane.pane_id.");
+      leftover.push(paneId);
+      return { paneId, cwd: options.cwd };
+    } catch (error) {
+      if (isAbortError(error)) {
+        for (const paneId of leftover.reverse()) {
+          await this.closePane(paneId).catch(() => undefined);
+        }
+      }
+      throw error;
     }
-
-    const callerPane = process.env.HERDR_PANE_ID;
-    if (!callerPane)
-      throw new Error(
-        "HERDR_PANE_ID is required to create a sibling agent pane.",
-      );
-    const direction =
-      options.direction ?? (await this.chooseSplitDirection(callerPane));
-    const split = await herdrJson<PaneSplitResult>([
-      "pane",
-      "split",
-      callerPane,
-      "--direction",
-      direction,
-      "--cwd",
-      options.cwd,
-      ...envArgs(options.env),
-      "--no-focus",
-    ]);
-    const paneId = split.result?.pane?.pane_id;
-    if (!paneId)
-      throw new Error("Herdr pane split did not return result.pane.pane_id.");
-    return { paneId, cwd: options.cwd };
   }
 
   async start(
     name: string,
     paneId: string,
     agentArgs: string[],
+    signal?: AbortSignal,
   ): Promise<RuntimeAgentState> {
+    if (signal?.aborted) throw abortError(signal);
     const args = [
       "agent",
       "start",
@@ -215,18 +246,18 @@ export class HerdrRuntime implements AgentRuntime {
     // prompt, and Herdr rejects `agent start` until then. Retry that
     // transient rejection with a short backoff instead of failing the spawn.
     for (let attempt = 0; attempt < 5; attempt++) {
+      if (signal?.aborted) throw abortError(signal);
       try {
-        const result = await herdrJson<AgentResult>(args);
+        const result = await herdrJson<AgentResult>(args, signal);
         return statusFromResult(result.result);
       } catch (error) {
         lastError = error;
+        if (isAbortError(error)) throw error;
         if (
           error instanceof HerdrCommandError &&
           /not an available shell/i.test(error.message)
         ) {
-          await new Promise((resolve) =>
-            setTimeout(resolve, 300 * (attempt + 1)),
-          );
+          await abortableDelay(300 * (attempt + 1), signal);
           continue;
         }
         throw error;
@@ -255,13 +286,16 @@ export class HerdrRuntime implements AgentRuntime {
     }
   }
 
-  async prompt(name: string, text: string): Promise<RuntimeAgentState> {
-    const result = await herdrJson<AgentResult>([
-      "agent",
-      "prompt",
-      name,
-      text,
-    ]);
+  async prompt(
+    name: string,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<RuntimeAgentState> {
+    if (signal?.aborted) throw abortError(signal);
+    const result = await herdrJson<AgentResult>(
+      ["agent", "prompt", name, text],
+      signal,
+    );
     return statusFromResult(result.result);
   }
 
@@ -333,16 +367,15 @@ export class HerdrRuntime implements AgentRuntime {
 
   private async chooseSplitDirection(
     callerPane: string,
+    signal?: AbortSignal,
   ): Promise<"right" | "down"> {
     try {
       // Use the explicit caller pane ID rather than UI focus. Herdr's skill
       // principle is caller-relative topology; explicit IDs also avoid focus races.
-      const response = await herdrJson<LayoutResult>([
-        "pane",
-        "layout",
-        "--pane",
-        callerPane,
-      ]);
+      const response = await herdrJson<LayoutResult>(
+        ["pane", "layout", "--pane", callerPane],
+        signal,
+      );
       const dims =
         findPaneDimensions(response.result, callerPane) ??
         dimensions(response.result?.area);
