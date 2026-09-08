@@ -32,6 +32,7 @@ describe("fleet config loading", () => {
     const warnings: string[] = [];
     const config = loadConfig(cwd, warnings);
     expect(config.maxConcurrent).toBe(6);
+    expect(config.defaultWaitTimeoutMs).toBe(120_000);
     expect(warnings).toEqual([]);
   });
 
@@ -56,5 +57,14 @@ describe("fleet config loading", () => {
     const config = loadConfig(cwd, warnings);
     expect(config.notifyOnComplete).toBe(true);
     expect(warnings.some((warning) => warning.includes(file))).toBe(true);
+  });
+
+  test("defaultWaitTimeoutMs can be overridden from project config", () => {
+    const { cwd } = isolatedDirs();
+    const file = path.join(cwd, ".pi", "herdr-fleet.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ defaultWaitTimeoutMs: 5000 }));
+    const config = loadConfig(cwd);
+    expect(config.defaultWaitTimeoutMs).toBe(5000);
   });
 });

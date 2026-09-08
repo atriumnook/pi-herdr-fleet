@@ -11,7 +11,7 @@ import {
 import { discoverAgents } from "./agents.js";
 import { loadConfig } from "./config.js";
 import { isHerdrAvailable, OUTSIDE_HERDR_WARNING } from "./herdr.js";
-import { Orchestrator } from "./orchestrator.js";
+import { Orchestrator, AgentWaitTimeoutError } from "./orchestrator.js";
 import { HerdrRuntime } from "./runtime-herdr.js";
 import { makeGroupId, RunRegistry } from "./registry.js";
 import type { AgentRun, ThinkingLevel } from "./types.js";
@@ -313,18 +313,36 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
       name: "agent_wait",
       label: "Wait Agent",
       description:
-        "Synchronize with a fleet agent using Herdr's server-owned semantic wait. Defaults to idle/done/blocked; prefer event-driven completion unless this call must block.",
+        `Synchronize with a fleet agent using Herdr's server-owned semantic wait. Defaults to idle/done/blocked. If timeout_ms is omitted, waits up to ${config.defaultWaitTimeoutMs}ms (configurable as defaultWaitTimeoutMs). Prefer event-driven completion unless this call must block.`,
       parameters: Type.Object({
         target: Type.String(),
         timeout_ms: Type.Optional(Type.Number({ minimum: 1 })),
       }),
-      async execute(_id, params, _signal, _onUpdate, ctx) {
+      async execute(_id, params, signal, _onUpdate, ctx) {
         activeCtx = ctx;
-        const run = await orchestrator.wait(params.target, params.timeout_ms);
-        return {
-          content: [{ type: "text", text: `${run.name} is ${run.state}.` }],
-          details: run,
-        };
+        try {
+          const run = await orchestrator.wait(
+            params.target,
+            params.timeout_ms,
+            signal,
+          );
+          return {
+            content: [{ type: "text", text: `${run.name} is ${run.state}.` }],
+            details: run,
+          };
+        } catch (error) {
+          if (error instanceof AgentWaitTimeoutError) {
+            return {
+              content: [{ type: "text", text: error.message }],
+              details: {
+                run: error.run,
+                timedOut: true,
+                timeoutMs: error.timeoutMs,
+              },
+            };
+          }
+          throw error;
+        }
       },
     }),
   );

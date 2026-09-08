@@ -91,6 +91,7 @@
 - **Where:** `src/index.ts` の各 `execute(..., _signal, ...)`、`src/orchestrator.ts` `wait()`、`src/runtime-herdr.ts` `wait()`（timeout 省略可）
 - **Why:** Herdr の `agent wait` はデフォルト timeout なし。モデルが `timeout_ms` を付け忘れるとターンが固まる。Pi がツールをキャンセルしても `_signal` 未使用なので CLI は生き残る。
 - **Direction:** `agent_wait` に設定可能なデフォルト（例: 120s）を足す。`signal` で `herdr` 子プロセスを kill するか、少なくとも wait を abort。`spawn`/`prompt` は最初は wait だけでよい。
+- **Status:** この PR で追加。`defaultWaitTimeoutMs` デフォルト 120000。`timeout_ms` 省略時はこれを Herdr `--timeout` に渡す。AbortSignal は `agent_wait` → `herdr` CLI（`execFile` の `signal` で子プロセスを kill）。timeout は `AgentWaitTimeoutError` として現在状態を返す。spawn/prompt は未対応。
 
 ## P2 — あるとよい
 
@@ -124,4 +125,6 @@
 1. ~~項目 4 の bundled-agent / registry 回帰テストと `bun run check` の CI~~ **済み**（この PR）
 2. ~~項目 2 の trailing sync と項目 3 の subscriber ゲート~~ **済み**（この PR）
 3. ~~項目 5 の警告~~ **済み**（この PR）
-4. 項目 6 の wait timeout / abort（固着ターンの防止）
+4. ~~項目 6 の wait timeout / abort~~ **済み**（この PR）
+
+P1 はここまで。次は P2（JSONL 原子性、完了 pane、設定 DX）。

@@ -265,10 +265,14 @@ export class HerdrRuntime implements AgentRuntime {
     return statusFromResult(result.result);
   }
 
-  async wait(name: string, timeoutMs?: number): Promise<RuntimeAgentState> {
+  async wait(
+    name: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<RuntimeAgentState> {
     const args = ["agent", "wait", name];
     if (timeoutMs !== undefined) args.push("--timeout", String(timeoutMs));
-    const result = await herdrJson<AgentResult>(args);
+    const result = await herdrJson<AgentResult>(args, signal);
     return statusFromResult(result.result);
   }
 

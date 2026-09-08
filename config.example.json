@@ -4,6 +4,7 @@
   "maxDepth": 2,
   "notifyOnComplete": true,
   "recentReadLines": 160,
+  "defaultWaitTimeoutMs": 120000,
   "roles": {
     "scout": {
       "model": "provider/fast-model",

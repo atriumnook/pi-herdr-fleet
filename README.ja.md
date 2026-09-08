@@ -56,6 +56,7 @@ agent_focus({ target: "planner" })
 {
   "maxConcurrent": 6,
   "maxDepth": 2,
+  "defaultWaitTimeoutMs": 120000,
   "roles": {
     "scout": {
       "model": "provider/fast-model",
@@ -69,7 +70,7 @@ agent_focus({ target: "planner" })
 }
 ```
 
-設定項目は [`config.example.json`](config.example.json) を参照してください。
+設定項目は [`config.example.json`](config.example.json) を参照してください。`defaultWaitTimeoutMs`（120000）は、モデルが `timeout_ms` を省略したときの `agent_wait` 上限です。
 
 ## ロール
 

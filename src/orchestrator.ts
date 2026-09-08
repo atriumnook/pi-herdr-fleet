@@ -6,7 +6,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { findAgent } from "./agents.js";
-import { HerdrCommandError } from "./herdr.js";
+import { abortError, HerdrCommandError, isAbortError } from "./herdr.js";
 import { HerdrEventSubscriber, type HerdrSocketEvent } from "./herdr-events.js";
 import { makeHerdrName, makeId, type RunRegistry } from "./registry.js";
 import type { AgentRuntime } from "./runtime.js";
@@ -71,6 +71,18 @@ function shortModel(model?: string): string {
   if (!model) return "inherit";
   const slash = model.lastIndexOf("/");
   return slash >= 0 ? model.slice(slash + 1) : model;
+}
+
+export class AgentWaitTimeoutError extends Error {
+  constructor(
+    readonly run: AgentRun,
+    readonly timeoutMs: number,
+  ) {
+    super(
+      `Wait timed out after ${timeoutMs}ms; ${run.name} is still ${run.state}.`,
+    );
+    this.name = "AgentWaitTimeoutError";
+  }
 }
 
 export class Orchestrator {
@@ -412,10 +424,28 @@ export class Orchestrator {
     return this.submit(run, message, true);
   }
 
-  async wait(target: string, timeoutMs?: number): Promise<AgentRun> {
+  async wait(
+    target: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<AgentRun> {
     const run = this.mustResolve(target);
-    const state = await this.runtime.wait(run.herdrName, timeoutMs);
-    this.updateState(run, state.status);
+    if (signal?.aborted) throw abortError(signal);
+    const timeout = timeoutMs ?? this.config.defaultWaitTimeoutMs;
+    try {
+      const state = await this.runtime.wait(run.herdrName, timeout, signal);
+      this.updateState(run, state.status);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (error instanceof HerdrCommandError && error.codeName === "timeout") {
+        const current = await this.runtime
+          .get(run.herdrName)
+          .catch(() => ({ status: run.state }));
+        this.updateState(run, current.status);
+        throw new AgentWaitTimeoutError(run, timeout);
+      }
+      throw error;
+    }
     const pending = this.pending.get(run.id);
     if (pending?.armed && run.state === "blocked")
       await this.notifyBlocked(run, pending);

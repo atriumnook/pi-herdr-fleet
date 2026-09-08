@@ -40,6 +40,7 @@ export interface FleetConfig {
   maxDepth: number;
   notifyOnComplete: boolean;
   recentReadLines: number;
+  defaultWaitTimeoutMs: number;
   roles: Record<string, RoleOverride>;
 }
 

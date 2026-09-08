@@ -8,7 +8,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { HerdrCommandError } from "../src/herdr.js";
 import { HerdrEventSubscriber } from "../src/herdr-events.js";
-import { Orchestrator } from "../src/orchestrator.js";
+import { Orchestrator, AgentWaitTimeoutError } from "../src/orchestrator.js";
 import { RunRegistry } from "../src/registry.js";
 import type {
   AgentMetadata,
@@ -29,10 +29,16 @@ class FakeRuntime implements AgentRuntime {
   closed: string[] = [];
   prompts: Array<{ name: string; text: string }> = [];
   startCalls: Array<{ name: string; paneId: string; agentArgs: string[] }> = [];
+  waitCalls: Array<{
+    name: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }> = [];
   createLocationDelayMs = 0;
   promptStatus: AgentState = "working";
   getStatus: AgentState = "working";
   startImpl?: AgentRuntime["start"];
+  waitImpl?: AgentRuntime["wait"];
   paneExistsImpl?: (paneId: string) => Promise<boolean>;
   private locations = 0;
 
@@ -72,7 +78,18 @@ class FakeRuntime implements AgentRuntime {
     return { status: this.promptStatus };
   }
 
-  async wait(name: string): Promise<RuntimeAgentState> {
+  async wait(
+    name: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<RuntimeAgentState> {
+    this.waitCalls.push({ name, timeoutMs, signal });
+    if (this.waitImpl) return this.waitImpl(name, timeoutMs, signal);
+    if (signal?.aborted) {
+      const error = new Error("This operation was aborted");
+      error.name = "AbortError";
+      throw error;
+    }
     return this.get(name);
   }
 
@@ -111,6 +128,7 @@ function config(overrides: Partial<FleetConfig> = {}): FleetConfig {
     maxDepth: 2,
     notifyOnComplete: true,
     recentReadLines: 80,
+    defaultWaitTimeoutMs: 120_000,
     roles: {},
     ...overrides,
   };
@@ -429,5 +447,67 @@ describe("orchestrator lifecycle", () => {
     const blocked = await orch.send(run.id, "answer the dialog");
     expect(blocked.state).toBe("blocked");
     expect(runtime.closed).toHaveLength(0);
+  });
+
+  test("wait uses the configured default timeout when timeout_ms is omitted", async () => {
+    const { orch, runtime } = makeHarness({ defaultWaitTimeoutMs: 45_000 });
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    runtime.getStatus = "idle";
+    const waited = await orch.wait(run.id);
+    expect(waited.state).toBe("idle");
+    expect(runtime.waitCalls.at(-1)?.timeoutMs).toBe(45_000);
+  });
+
+  test("wait passes an explicit timeout through to the runtime", async () => {
+    const { orch, runtime } = makeHarness();
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    runtime.getStatus = "done";
+    await orch.wait(run.id, 3_000);
+    expect(runtime.waitCalls.at(-1)?.timeoutMs).toBe(3_000);
+  });
+
+  test("wait maps a Herdr timeout to AgentWaitTimeoutError after refreshing state", async () => {
+    const { orch, runtime } = makeHarness();
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    runtime.waitImpl = async () => {
+      throw new HerdrCommandError("deadline exceeded", "timeout");
+    };
+    runtime.getStatus = "working";
+    try {
+      await orch.wait(run.id, 1_000);
+      throw new Error("expected AgentWaitTimeoutError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentWaitTimeoutError);
+      const timedOut = error as AgentWaitTimeoutError;
+      expect(timedOut.timeoutMs).toBe(1_000);
+      expect(timedOut.run.state).toBe("working");
+    }
+  });
+
+  test("wait aborts when the tool AbortSignal fires", async () => {
+    const { orch, runtime } = makeHarness();
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    runtime.waitImpl = async (_name, _timeoutMs, signal) => {
+      release();
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 5_000);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          const error = new Error("This operation was aborted");
+          error.name = "AbortError";
+          reject(error);
+        });
+      });
+      return { status: "idle" };
+    };
+    const controller = new AbortController();
+    const pending = orch.wait(run.id, 30_000, controller.signal);
+    await entered;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 });

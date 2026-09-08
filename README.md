@@ -56,6 +56,7 @@ Project settings go in `.pi/herdr-fleet.json`. User settings go in `~/.pi/agent/
 {
   "maxConcurrent": 6,
   "maxDepth": 2,
+  "defaultWaitTimeoutMs": 120000,
   "roles": {
     "scout": {
       "model": "provider/fast-model",
@@ -69,7 +70,7 @@ Project settings go in `.pi/herdr-fleet.json`. User settings go in `~/.pi/agent/
 }
 ```
 
-See [`config.example.json`](config.example.json) for the available options.
+See [`config.example.json`](config.example.json) for the available options. `defaultWaitTimeoutMs` (120000) bounds `agent_wait` when the model omits `timeout_ms`.
 
 ## Roles
 

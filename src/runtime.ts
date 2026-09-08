@@ -37,7 +37,11 @@ export interface AgentRuntime {
   closePane(paneId: string): Promise<void>;
   paneExists(paneId: string): Promise<boolean>;
   prompt(name: string, text: string): Promise<RuntimeAgentState>;
-  wait(name: string, timeoutMs?: number): Promise<RuntimeAgentState>;
+  wait(
+    name: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<RuntimeAgentState>;
   get(name: string): Promise<RuntimeAgentState>;
   read(name: string, lines: number): Promise<string>;
   interrupt(name: string): Promise<void>;

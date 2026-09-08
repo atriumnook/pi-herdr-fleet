@@ -9,6 +9,7 @@ const DEFAULTS: FleetConfig = {
   maxDepth: 2,
   notifyOnComplete: true,
   recentReadLines: 160,
+  defaultWaitTimeoutMs: 120_000,
   roles: {},
 };
 
@@ -71,6 +72,7 @@ function mergeConfig(base: FleetConfig, raw: Record<string, unknown>): FleetConf
     maxDepth: typeof raw.maxDepth === "number" ? Math.max(0, Math.floor(raw.maxDepth)) : base.maxDepth,
     notifyOnComplete: typeof raw.notifyOnComplete === "boolean" ? raw.notifyOnComplete : base.notifyOnComplete,
     recentReadLines: typeof raw.recentReadLines === "number" ? Math.max(20, Math.floor(raw.recentReadLines)) : base.recentReadLines,
+    defaultWaitTimeoutMs: typeof raw.defaultWaitTimeoutMs === "number" ? Math.max(1, Math.floor(raw.defaultWaitTimeoutMs)) : base.defaultWaitTimeoutMs,
     roles,
   };
 }
