@@ -2,7 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
-import { makeHerdrName, RunRegistry } from "../src/registry.js";
+import {
+  makeHerdrName,
+  MAX_REGISTRY_RECORD_BYTES,
+  RunRegistry,
+} from "../src/registry.js";
 import type { AgentRun } from "../src/types.js";
 
 function tempRegistry(): { file: string; a: RunRegistry; b: RunRegistry } {
@@ -45,13 +49,92 @@ test("registry is shared and resolves the latest role instance", () => {
 });
 
 describe("append-only registry caching", () => {
-  test("caps persisted lastOutput so long sessions stay parseable", () => {
-    const { a } = tempRegistry();
+  test("does not persist lastOutput, but keeps it in the writing process", () => {
+    const { file, a, b } = tempRegistry();
     const lastOutput = "x".repeat(5000);
     a.upsert(run({ lastOutput }));
-    const stored = a.all()[0]?.lastOutput ?? "";
-    expect(stored.length).toBe(4000);
-    expect(stored).toBe(lastOutput.slice(-4000));
+    const disk = fs.readFileSync(file, "utf8");
+    expect(disk).not.toContain("lastOutput");
+    expect(a.all()[0]?.lastOutput).toBe(lastOutput);
+    expect(b.all()[0]?.lastOutput).toBeUndefined();
+  });
+
+  test("keeps each JSONL record within PIPE_BUF including a huge lastError", () => {
+    const { file, a, b } = tempRegistry();
+    a.upsert(
+      run({
+        lastOutput: "out".repeat(3000),
+        lastError: "e".repeat(8000),
+        cwd: `/${"very-long-segment/".repeat(40)}repo`,
+        model: "provider/an-unusually-long-model-id:thinking",
+      }),
+    );
+    const lines = fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .filter((line) => line.trim());
+    expect(lines).toHaveLength(1);
+    expect(Buffer.byteLength(`${lines[0]}\n`, "utf8")).toBeLessThanOrEqual(
+      MAX_REGISTRY_RECORD_BYTES,
+    );
+    const parsed = JSON.parse(lines[0] ?? "") as { run?: { lastError?: string } };
+    expect(parsed.run?.lastError).toBeDefined();
+    expect(parsed.run?.lastError?.length ?? 0).toBeLessThan(8000);
+    expect(b.all()).toHaveLength(1);
+    expect(b.all()[0]?.id).toBe("11111111");
+  });
+
+  test("concurrent upserts from two writers stay parseable JSONL lines", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-registry-"));
+    const file = path.join(dir, "runs.jsonl");
+    const writers = [
+      new RunRegistry(file, "fleet-test"),
+      new RunRegistry(file, "fleet-test"),
+    ];
+    const perWriter = 40;
+    for (let n = 0; n < perWriter; n++) {
+      writers[0]?.upsert(
+        run({
+          id: `a${n.toString().padStart(7, "0")}`,
+          lastOutput: "x".repeat(6000),
+          lastError: "err".repeat(2000),
+          startedAt: n,
+        }),
+      );
+      writers[1]?.upsert(
+        run({
+          id: `b${n.toString().padStart(7, "0")}`,
+          paneId: "w1:p9",
+          lastOutput: "y".repeat(6000),
+          lastError: "err".repeat(2000),
+          startedAt: n + 1000,
+        }),
+      );
+    }
+    const lines = fs
+      .readFileSync(file)
+      .toString("utf8")
+      .split("\n")
+      .filter((line) => line.trim());
+    for (const line of lines) {
+      expect(Buffer.byteLength(`${line}\n`, "utf8")).toBeLessThanOrEqual(
+        MAX_REGISTRY_RECORD_BYTES,
+      );
+      JSON.parse(line);
+    }
+    const reader = new RunRegistry(file, "fleet-test");
+    expect(reader.all()).toHaveLength(perWriter * 2);
+  });
+
+  test("still reads legacy records that stored lastOutput", () => {
+    const { file, a } = tempRegistry();
+    const event = {
+      group: "fleet-test",
+      at: 1,
+      run: run({ lastOutput: "legacy preview" }),
+    };
+    fs.appendFileSync(file, `${JSON.stringify(event)}\n`);
+    expect(a.all()[0]?.lastOutput).toBe("legacy preview");
   });
 
   test("parses only newly appended bytes across registry instances", () => {

@@ -100,6 +100,7 @@
 - **Where:** `src/registry.ts`（`appendFileSync`、`MAX_STORED_OUTPUT = 4000`）
 - **Why:** POSIX の O_APPEND 原子性はだいたい `PIPE_BUF`（4KiB）。`lastOutput` 4000 文字にメタデータを足すと 1 レコードがそれを超える。ネスト spawn（別プロセス）が同時 upsert すると行が壊れ、増分パーサはその行を永久に飛ばす。ファイル自体も compaction 無し。
 - **Direction:** `lastOutput` を registry に書かない（finalize は同プロセスのメモリで足りる）、またはレコードを 4KiB 未満に保つ。長セッション用に「最新状態だけ」への周期 rewind は任意。クロスプロセスの同時実行予算は、デフォルト role が `spawning: false` なので急がない。
+- **Status:** この PR で `lastOutput` を JSONL に書かない。1 レコード（改行込み）を `PIPE_BUF`（4096）以下に収め、O_APPEND の単一 `writeSync` にする。書き込み側プロセスのメモリには `lastOutput` を残す。旧レコード（`lastOutput` 付き）は読める。compaction / rewind は未着手。
 
 ### 8. 完了 pane が残り、blocked フローはまだ E2E されていない
 
@@ -126,5 +127,6 @@
 2. ~~項目 2 の trailing sync と項目 3 の subscriber ゲート~~ **済み**（この PR）
 3. ~~項目 5 の警告~~ **済み**（この PR）
 4. ~~項目 6 の wait timeout / abort~~ **済み**（この PR）
+5. ~~項目 7 の JSONL / PIPE_BUF~~ **済み**（この PR）
 
-P1 はここまで。次は P2（JSONL 原子性、完了 pane、設定 DX）。
+次は P2 の残り（完了 pane、設定 DX）。

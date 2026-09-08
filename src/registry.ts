@@ -20,9 +20,12 @@ function slug(value: string, max = 20): string {
   return safe.slice(0, max).replace(/-+$/g, "") || "agent";
 }
 
-// Terminal output snapshots dominate registry volume; cap what is persisted so
-// a long session cannot turn every registry read into megabytes of parsing.
-const MAX_STORED_OUTPUT = 4_000;
+// POSIX O_APPEND writes are atomic up to PIPE_BUF (4096 on Linux/macOS).
+// Node's writeSync with O_APPEND cannot safely resume a partial write: each
+// call seeks to the current EOF, so a second syscall can land after another
+// process's record and tear a JSONL line. Keep every record, including the
+// trailing newline, to one PIPE_BUF-sized write.
+export const MAX_REGISTRY_RECORD_BYTES = 4096;
 
 export function makeId(): string {
   return crypto.randomBytes(4).toString("hex");
@@ -38,6 +41,50 @@ export function makeHerdrName(group: string, role: string, id: string): string {
     `${group.replace(/^fleet-/, "f")}-${slug(role, 12)}-${suffix}`,
     32,
   );
+}
+
+function persistableRun(run: AgentRun): AgentRun {
+  // lastOutput is turn preview for same-process notify; it is the field that
+  // pushed records past PIPE_BUF. Finalize/notify re-read Herdr when needed.
+  const { lastOutput: _lastOutput, ...rest } = run;
+  return rest;
+}
+
+function encodeLine(event: RegistryEvent): Buffer {
+  const payload: RegistryEvent = {
+    group: event.group,
+    at: event.at,
+    run: persistableRun(event.run),
+  };
+  const encode = (value: RegistryEvent) =>
+    Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+
+  let buf = encode(payload);
+  if (buf.length <= MAX_REGISTRY_RECORD_BYTES) return buf;
+
+  const run = { ...payload.run };
+  payload.run = run;
+  const shrink = (key: "lastError" | "model" | "cwd"): void => {
+    while (buf.length > MAX_REGISTRY_RECORD_BYTES) {
+      const current = run[key];
+      if (typeof current !== "string" || current.length === 0) return;
+      const extra = buf.length - MAX_REGISTRY_RECORD_BYTES;
+      const minLen = key === "cwd" ? 1 : 0;
+      const cut = Math.min(
+        current.length - minLen,
+        Math.max(1, extra),
+      );
+      if (cut <= 0) return;
+      const next = current.slice(0, current.length - cut);
+      if (next) run[key] = next;
+      else delete run[key];
+      buf = encode(payload);
+    }
+  };
+  shrink("lastError");
+  shrink("model");
+  shrink("cwd");
+  return buf;
 }
 
 export class RunRegistry {
@@ -56,19 +103,20 @@ export class RunRegistry {
   }
 
   upsert(run: AgentRun): void {
-    const stored: AgentRun =
-      run.lastOutput && run.lastOutput.length > MAX_STORED_OUTPUT
-        ? { ...run, lastOutput: run.lastOutput.slice(-MAX_STORED_OUTPUT) }
-        : run;
+    this.runs.set(run.id, { ...run });
     const event: RegistryEvent = {
       group: this.group,
       at: Date.now(),
-      run: { ...stored },
+      run,
     };
-    fs.appendFileSync(this.filePath, `${JSON.stringify(event)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
+    const line = encodeLine(event);
+    const fd = fs.openSync(this.filePath, "a", 0o600);
+    try {
+      // One writeSync: O_APPEND plus a buffer <= PIPE_BUF is the atomic unit.
+      fs.writeSync(fd, line, 0, line.length);
+    } finally {
+      fs.closeSync(fd);
+    }
   }
 
   all(): AgentRun[] {
@@ -117,6 +165,10 @@ export class RunRegistry {
           try {
             const event = JSON.parse(line) as RegistryEvent;
             if (event.group === this.group && event.run?.id) {
+              const previous = this.runs.get(event.run.id);
+              if (previous?.lastOutput && event.run.lastOutput === undefined) {
+                event.run.lastOutput = previous.lastOutput;
+              }
               this.runs.set(event.run.id, event.run);
             }
           } catch {
