@@ -163,8 +163,10 @@ describe("HerdrEventSubscriber connecting gate", () => {
       expect(mock.connectionCount).toBe(1);
       expect(mock.subscribeCalls[0]?.paneIds).toEqual(["w1:p1"]);
 
+      // ensurePanes updates this.panes synchronously but returns the in-flight
+      // handshake promise; awaiting it here would deadlock until we ack.
       for (let i = 2; i <= 6; i++) {
-        await subscriber.ensurePanes(
+        void subscriber.ensurePanes(
           Array.from({ length: i }, (_, index) => `w1:p${index + 1}`),
         );
       }
@@ -222,8 +224,8 @@ describe("HerdrEventSubscriber connecting gate", () => {
       );
       expect(mock.connectionCount).toBe(afterStart + 1);
 
-      await subscriber.ensurePanes(["w1:p1", "w1:p2"]);
-      await subscriber.ensurePanes(["w1:p1", "w1:p2", "w1:p3"]);
+      void subscriber.ensurePanes(["w1:p1", "w1:p2"]);
+      void subscriber.ensurePanes(["w1:p1", "w1:p2", "w1:p3"]);
       await new Promise((resolve) => setTimeout(resolve, 40));
       expect(mock.connectionCount).toBe(afterStart + 1);
 
@@ -276,7 +278,7 @@ describe("HerdrEventSubscriber connecting gate", () => {
         1_500,
         "start() did not send subscribe",
       );
-      await subscriber.ensurePanes(["w1:p1"]);
+      void subscriber.ensurePanes(["w1:p1"]);
       await new Promise((resolve) => setTimeout(resolve, 40));
       expect(mock.connectionCount).toBe(1);
       expect(ready).toHaveLength(0);
