@@ -77,7 +77,7 @@ agent_focus({ target: "planner" })
 | --- | --- | --- |
 | `runtime` | `"herdr"` | Herdr のみ対応。 |
 | `defaultModel` | 未設定（Pi セッション） | role に `model` が無いときのフォールバック。 |
-| `defaultThinking` | 未設定（Pi セッション） | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`。 |
+| `defaultThinking` | 未設定（Pi セッション） | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`。設定と agent frontmatter は不明な値を無視し、`agent_spawn` は拒否する。 |
 | `maxConcurrent` | `6` | `starting` または `working` の上限。idle / done / blocked は数えない。 |
 | `maxDepth` | `2` | ネスト上限。下記参照。 |
 | `notifyOnComplete` | `true` | 非 interactive のターン完了時に呼び出し元を起こす。 |

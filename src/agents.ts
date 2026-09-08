@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import type { AgentDefinition, ThinkingLevel } from "./types.js";
+import { parseThinkingLevel, type AgentDefinition } from "./types.js";
 
 type Frontmatter = {
   name?: unknown;
@@ -19,13 +19,6 @@ function parseList(value: unknown): string[] | undefined {
   const raw = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
   const out = raw.filter((x): x is string => typeof x === "string").map((x) => x.trim()).filter(Boolean);
   return out.length ? out : undefined;
-}
-
-function parseThinking(v: unknown): ThinkingLevel | undefined {
-  const s = String(v);
-  return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(s)
-    ? (s as ThinkingLevel)
-    : undefined;
 }
 
 function loadDir(
@@ -47,7 +40,7 @@ function loadDir(
         name,
         description,
         model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
-        thinking: parseThinking(frontmatter.thinking),
+        thinking: parseThinkingLevel(frontmatter.thinking),
         tools: parseList(frontmatter.tools),
         worktree: typeof frontmatter.worktree === "boolean" ? frontmatter.worktree : undefined,
         interactive: typeof frontmatter.interactive === "boolean" ? frontmatter.interactive : undefined,

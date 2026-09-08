@@ -114,7 +114,7 @@
 - **Where:** `config.example.json`、`src/index.ts` `thinking` のキャスト、`src/orchestrator.ts` の `spawning` × `maxDepth`
 - **Why:** example に `spawning` / `interactive` / `defaultModel` が無い。`thinking` は `as ThinkingLevel` で通る。`maxDepth` は「この Orchestrator の depth が max 以上なら spawn 不可」で、bundled role は `spawning: false` のため実効的には root だけが spawn する。README からは読み取りにくい。
 - **Direction:** example と README に `spawning` / `maxDepth` の実効ルールを 5 行で書く。`thinking` は spawn 時に不正値を弾く。コードの分岐は触らない。
-- **Status:** この PR で `config.example.json` と README（英/日）に全キーと `spawning` × `maxDepth` の実効ルールを書いた。`thinking` の spawn 時バリデーションは docs-only のため未着手（config / frontmatter は不正値を既に無視する）。
+- **Status:** この PR で `config.example.json` と README（英/日）に全キーと `spawning` × `maxDepth` の実効ルールを書いた。`thinking` は spawn 時に `off|minimal|low|medium|high|xhigh|max` 以外を明確なエラーで拒否する（pane は作らない）。config / frontmatter は不正値を引き続き無視する。
 
 ## やらなくてよいこと
 
@@ -131,9 +131,8 @@
 4. ~~項目 6 の wait timeout / abort~~ **済み**（この PR）
 5. ~~項目 7 の JSONL / PIPE_BUF~~ **済み**（この PR）。compaction / rewind も済み。
 6. ~~項目 8 の完了 pane 回収 / `closeOnSettle` / `/fleet close` / blocked 単体~~ **済み**（この PR）
-7. ~~項目 9 の設定 DX（example / README）~~ **済み**（この PR）
+7. ~~項目 9 の設定 DX（example / README）と spawn 時 thinking 拒否~~ **済み**（この PR）
 
 このレビューの P0–P2 ドキュメント項目は一通り入れた。残るのは後回しにした実装:
 
-- spawn 時の不正 `thinking` 拒否（項目 9 の Direction）
 - `spawn` / `prompt` の AbortSignal（項目 6、wait 以外）

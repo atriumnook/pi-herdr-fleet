@@ -77,7 +77,7 @@ Copy [`config.example.json`](config.example.json) to `.pi/herdr-fleet.json` (pro
 | --- | --- | --- |
 | `runtime` | `"herdr"` | Only Herdr is supported. |
 | `defaultModel` | unset (Pi session) | Fallback when the role has no `model`. |
-| `defaultThinking` | unset (Pi session) | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. |
+| `defaultThinking` | unset (Pi session) | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. Config and agent frontmatter ignore unknown values; `agent_spawn` rejects them. |
 | `maxConcurrent` | `6` | Caps agents in `starting` or `working`. Idle, done, and blocked do not count. |
 | `maxDepth` | `2` | Nesting limit; see below. |
 | `notifyOnComplete` | `true` | Wake the caller when a non-interactive turn settles. |

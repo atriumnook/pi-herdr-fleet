@@ -227,6 +227,31 @@ describe("orchestrator lifecycle", () => {
     expect(run.state).toBe("working");
   });
 
+  test("accepts an explicit valid thinking level on spawn", async () => {
+    const { orch, runtime } = makeHarness();
+    const run = await orch.spawn(
+      {
+        role: "scout",
+        task: "go",
+        thinking: "high",
+        model: "provider/fast",
+      },
+      fakeCtx(),
+    );
+    expect(run.thinking).toBe("high");
+    expect(runtime.startCalls[0]?.agentArgs).toContain("provider/fast:high");
+  });
+
+  test("rejects an invalid thinking level before creating a pane", async () => {
+    const { orch, runtime } = makeHarness();
+    await expect(
+      orch.spawn({ role: "scout", task: "go", thinking: "turbo" }, fakeCtx()),
+    ).rejects.toThrow(/Invalid thinking level "turbo".*off, minimal, low, medium, high, xhigh, max/);
+    expect(runtime.startCalls).toEqual([]);
+    expect(runtime.closed).toEqual([]);
+    expect(orch.list()).toEqual([]);
+  });
+
   test("passes the multiline fleet prompt as a file, then deletes it", async () => {
     const { orch, runtime } = makeHarness();
     let promptFile = "";

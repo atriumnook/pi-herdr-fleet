@@ -15,7 +15,7 @@ import { isHerdrAvailable, OUTSIDE_HERDR_WARNING } from "./herdr.js";
 import { Orchestrator, AgentWaitTimeoutError } from "./orchestrator.js";
 import { HerdrRuntime } from "./runtime-herdr.js";
 import { makeGroupId, RunRegistry } from "./registry.js";
-import type { AgentRun, ThinkingLevel } from "./types.js";
+import { THINKING_LEVELS, type AgentRun } from "./types.js";
 
 const STATE_ICON: Record<AgentRun["state"], string> = {
   starting: "…",
@@ -216,7 +216,9 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
           }),
         ),
         thinking: Type.Optional(
-          Type.String({ description: "off|minimal|low|medium|high|xhigh|max" }),
+          Type.String({
+            description: THINKING_LEVELS.join("|"),
+          }),
         ),
         cwd: Type.Optional(
           Type.String({
@@ -254,9 +256,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
             task: params.task,
             name: params.name,
             model: params.model,
-            // Tool schema lists off|minimal|low|medium|high|xhigh|max; config
-            // and agent frontmatter already drop unknown values.
-            thinking: params.thinking as ThinkingLevel | undefined,
+            thinking: params.thinking,
             cwd: params.cwd,
             worktree: params.worktree,
             direction,

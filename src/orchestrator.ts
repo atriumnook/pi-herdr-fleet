@@ -10,13 +10,14 @@ import { abortError, HerdrCommandError, isAbortError } from "./herdr.js";
 import { HerdrEventSubscriber, type HerdrSocketEvent } from "./herdr-events.js";
 import { makeHerdrName, makeId, type RunRegistry } from "./registry.js";
 import type { AgentRuntime } from "./runtime.js";
-import type {
-  AgentDefinition,
-  AgentRun,
-  AgentState,
-  FleetConfig,
-  SpawnRequest,
-  ThinkingLevel,
+import {
+  requireThinkingLevel,
+  type AgentDefinition,
+  type AgentRun,
+  type AgentState,
+  type FleetConfig,
+  type SpawnRequest,
+  type ThinkingLevel,
 } from "./types.js";
 
 interface PendingTurn {
@@ -352,12 +353,14 @@ export class Orchestrator {
       definition.model ??
       this.config.defaultModel ??
       modelFromContext(ctx);
-    const thinking =
-      request.thinking ??
-      override.thinking ??
-      definition.thinking ??
-      this.config.defaultThinking ??
-      this.pi.getThinkingLevel();
+    const thinking = requireThinkingLevel(
+      request.thinking !== undefined
+        ? request.thinking
+        : (override.thinking ??
+          definition.thinking ??
+          this.config.defaultThinking ??
+          this.pi.getThinkingLevel()),
+    );
     const worktree =
       request.worktree ?? override.worktree ?? definition.worktree ?? false;
     const interactive =

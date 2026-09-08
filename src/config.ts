@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { FleetConfig, RoleOverride, ThinkingLevel } from "./types.js";
+import {
+  isThinkingLevel,
+  type FleetConfig,
+  type RoleOverride,
+} from "./types.js";
 
 const DEFAULTS: FleetConfig = {
   runtime: "herdr",
@@ -42,16 +46,12 @@ function readJson(file: string, warnings?: string[]): Record<string, unknown> {
   }
 }
 
-function isThinking(v: unknown): v is ThinkingLevel {
-  return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(v));
-}
-
 function parseRole(value: unknown): RoleOverride {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const v = value as Record<string, unknown>;
   return {
     model: typeof v.model === "string" ? v.model : undefined,
-    thinking: isThinking(v.thinking) ? v.thinking : undefined,
+    thinking: isThinkingLevel(v.thinking) ? v.thinking : undefined,
     worktree: typeof v.worktree === "boolean" ? v.worktree : undefined,
     interactive: typeof v.interactive === "boolean" ? v.interactive : undefined,
     spawning: typeof v.spawning === "boolean" ? v.spawning : undefined,
@@ -68,7 +68,7 @@ function mergeConfig(base: FleetConfig, raw: Record<string, unknown>): FleetConf
   return {
     runtime: "herdr",
     defaultModel: typeof raw.defaultModel === "string" ? raw.defaultModel : base.defaultModel,
-    defaultThinking: isThinking(raw.defaultThinking) ? raw.defaultThinking : base.defaultThinking,
+    defaultThinking: isThinkingLevel(raw.defaultThinking) ? raw.defaultThinking : base.defaultThinking,
     maxConcurrent: typeof raw.maxConcurrent === "number" ? Math.max(1, Math.floor(raw.maxConcurrent)) : base.maxConcurrent,
     maxDepth: typeof raw.maxDepth === "number" ? Math.max(0, Math.floor(raw.maxDepth)) : base.maxDepth,
     notifyOnComplete: typeof raw.notifyOnComplete === "boolean" ? raw.notifyOnComplete : base.notifyOnComplete,

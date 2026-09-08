@@ -1,4 +1,35 @@
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export const THINKING_LEVELS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return (
+    typeof value === "string" &&
+    (THINKING_LEVELS as readonly string[]).includes(value)
+  );
+}
+
+/** Config / frontmatter: drop unknown values instead of failing the file. */
+export function parseThinkingLevel(value: unknown): ThinkingLevel | undefined {
+  return isThinkingLevel(value) ? value : undefined;
+}
+
+/** Spawn-time: an explicit value must be a known level. */
+export function requireThinkingLevel(value: unknown): ThinkingLevel | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (isThinkingLevel(value)) return value;
+  throw new Error(
+    `Invalid thinking level ${JSON.stringify(value)}. Use one of: ${THINKING_LEVELS.join(", ")}.`,
+  );
+}
 
 export type AgentState =
   | "starting"
@@ -70,7 +101,7 @@ export interface SpawnRequest {
   role: string;
   task: string;
   model?: string;
-  thinking?: ThinkingLevel;
+  thinking?: string;
   cwd?: string;
   worktree?: boolean;
   interactive?: boolean;
