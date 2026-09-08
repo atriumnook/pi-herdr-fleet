@@ -131,6 +131,7 @@ function config(overrides: Partial<FleetConfig> = {}): FleetConfig {
     notifyOnComplete: true,
     recentReadLines: 80,
     defaultWaitTimeoutMs: 120_000,
+    closeOnSettle: true,
     roles: {},
     ...overrides,
   };
@@ -684,7 +685,10 @@ describe("orchestrator lifecycle", () => {
   });
 
   test("wait uses the configured default timeout when timeout_ms is omitted", async () => {
-    const { orch, runtime } = makeHarness({ defaultWaitTimeoutMs: 45_000 });
+    const { orch, runtime } = makeHarness({
+      defaultWaitTimeoutMs: 45_000,
+      closeOnSettle: false,
+    });
     const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
     runtime.getStatus = "idle";
     const waited = await orch.wait(run.id);
@@ -693,7 +697,7 @@ describe("orchestrator lifecycle", () => {
   });
 
   test("wait passes an explicit timeout through to the runtime", async () => {
-    const { orch, runtime } = makeHarness();
+    const { orch, runtime } = makeHarness({ closeOnSettle: false });
     const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
     runtime.getStatus = "done";
     await orch.wait(run.id, 3_000);
@@ -701,7 +705,7 @@ describe("orchestrator lifecycle", () => {
   });
 
   test("wait maps a Herdr timeout to AgentWaitTimeoutError after refreshing state", async () => {
-    const { orch, runtime } = makeHarness();
+    const { orch, runtime } = makeHarness({ closeOnSettle: false });
     const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
     runtime.waitImpl = async () => {
       throw new HerdrCommandError("deadline exceeded", "timeout");
@@ -719,7 +723,7 @@ describe("orchestrator lifecycle", () => {
   });
 
   test("wait aborts when the tool AbortSignal fires", async () => {
-    const { orch, runtime } = makeHarness();
+    const { orch, runtime } = makeHarness({ closeOnSettle: false });
     const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
     let release!: () => void;
     const entered = new Promise<void>((resolve) => {
@@ -743,5 +747,123 @@ describe("orchestrator lifecycle", () => {
     await entered;
     controller.abort();
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  test("closeOnSettle closes a non-interactive pane when wait sees settlement", async () => {
+    const { orch, runtime } = makeHarness();
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    runtime.getStatus = "idle";
+    const waited = await orch.wait(run.id);
+    expect(waited.state).toBe("stopped");
+    expect(runtime.closed).toEqual([run.paneId]);
+  });
+
+  test("closeOnSettle false leaves a settled pane open after wait", async () => {
+    const { orch, runtime } = makeHarness({ closeOnSettle: false });
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    runtime.getStatus = "done";
+    const waited = await orch.wait(run.id);
+    expect(waited.state).toBe("done");
+    expect(runtime.closed).toEqual([]);
+  });
+
+  test("closeOnSettle false does not reap a stale settled pane", async () => {
+    const { orch, runtime, registry } = makeHarness({ closeOnSettle: false });
+    const ago = Date.now() - 20_000;
+    registry.upsert({
+      id: "keepdone1",
+      name: "Scout",
+      role: "scout",
+      herdrName: "fleet-scout-keep",
+      paneId: "w1:keep",
+      cwd: "/tmp/repo",
+      state: "done",
+      depth: 1,
+      interactive: false,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    });
+    runtime.getStatus = "done";
+    delete process.env.HERDR_SOCKET_PATH;
+    await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+    expect(runtime.closed).toEqual([]);
+    expect(registry.byPane("w1:keep")?.state).toBe("done");
+  });
+
+  test("closeDonePanes closes done panes and skips idle, blocked, and interactive", async () => {
+    const { orch, runtime, registry } = makeHarness({ closeOnSettle: false });
+    const ago = Date.now() - 20_000;
+    const base = {
+      role: "scout",
+      cwd: "/tmp/repo",
+      depth: 1,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    } as const;
+    registry.upsert({
+      ...base,
+      id: "done00001",
+      name: "Scout",
+      herdrName: "fleet-scout-done",
+      paneId: "w1:done",
+      state: "done",
+      interactive: false,
+    });
+    registry.upsert({
+      ...base,
+      id: "idle00001",
+      name: "Scout",
+      herdrName: "fleet-scout-idle",
+      paneId: "w1:idle",
+      state: "idle",
+      interactive: false,
+    });
+    registry.upsert({
+      ...base,
+      id: "block0001",
+      name: "Scout",
+      herdrName: "fleet-scout-blk2",
+      paneId: "w1:blk2",
+      state: "blocked",
+      interactive: false,
+    });
+    registry.upsert({
+      ...base,
+      id: "plandone1",
+      name: "Planner",
+      role: "planner",
+      herdrName: "fleet-planner-done",
+      paneId: "w1:pldone",
+      state: "done",
+      interactive: true,
+    });
+    runtime.getStatus = "done";
+    const closed = await orch.closeDonePanes();
+    expect(closed.map((item) => item.paneId)).toEqual(["w1:done"]);
+    expect(runtime.closed).toEqual(["w1:done"]);
+    expect(registry.byPane("w1:done")?.state).toBe("stopped");
+    expect(registry.byPane("w1:idle")?.state).toBe("idle");
+    expect(registry.byPane("w1:blk2")?.state).toBe("blocked");
+    expect(registry.byPane("w1:pldone")?.state).toBe("done");
+  });
+
+  test("wait on a blocked agent notifies and does not close the pane", async () => {
+    const { orch, runtime, messages } = makeHarness();
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    runtime.waitImpl = async () => ({ status: "blocked" });
+    const waited = await orch.wait(run.id);
+    expect(waited.state).toBe("blocked");
+    expect(runtime.closed).toEqual([]);
+    expect(
+      messages.some(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          "customType" in message &&
+          message.customType === "fleet-agent-attention",
+      ),
+    ).toBe(true);
   });
 });

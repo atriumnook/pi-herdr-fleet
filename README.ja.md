@@ -31,7 +31,10 @@ Herdr 内で Pi を起動し、現在の fleet を確認します。
 
 ```text
 /fleet
+/fleet close
 ```
+
+`/fleet` は一覧です。`/fleet close`（または `/fleet close done`）は、Herdr がまだ `done` と報告している非 interactive pane を閉じます。interactive / blocked / idle / 進行中の pane は残します。
 
 普段はそのまま Pi に依頼できます。
 
@@ -80,6 +83,7 @@ agent_focus({ target: "planner" })
 | `notifyOnComplete` | `true` | 非 interactive のターン完了時に呼び出し元を起こす。 |
 | `recentReadLines` | `160` | `agent_read` と完了通知が読む行数（下限 20）。 |
 | `defaultWaitTimeoutMs` | `120000` | モデルが `timeout_ms` を省略したときの `agent_wait` 上限。 |
+| `closeOnSettle` | `true` | 非 interactive の `idle`/`done` をターン完了後に閉じる（sync 時も同じ年齢・再確認ゲート）。`false` なら `/fleet close` まで pane を残す。 |
 | `roles.<name>` | `{}` | role ごとの `model` / `thinking` / `worktree` / `interactive` / `spawning`。 |
 
 ### ネスト（`spawning` × `maxDepth`）
@@ -140,7 +144,7 @@ Herdr 0.8.2 と Pi 0.85.0 でライブ E2E テスト済み。
 spawn、ライフサイクル完了通知、モデルルーティング、ピアメッセージング、
 エージェント制御、worktree 分離、同時実行制限とネスト。
 
-blocked・startup-blocked のフローは、決定論的な E2E テストではまだカバーされていません。
+blocked / startup-blocked は orchestrator の単体テスト（`agent_blocked` / `agent_not_ready`）でカバーしています。Herdr の approval UI を使うライブ E2E はまだ決定論スイートに入っていません。
 
 ## クレジット
 

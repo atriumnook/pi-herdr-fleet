@@ -152,7 +152,7 @@ export class Orchestrator {
     // pane with pane_not_found, which would otherwise wedge the subscriber in
     // a reconnect loop and permanently leak concurrency slots.
     await this.pruneOrphanRuns();
-    await this.reapSettledPanes();
+    if (this.config.closeOnSettle) await this.reapSettledPanes();
     await this.events.ensurePanes(
       this.list()
         .filter(isLive)
@@ -190,7 +190,7 @@ export class Orchestrator {
         this.syncQueued = false;
         if (!this.eventsStarted) break;
         await this.pruneOrphanRuns();
-        await this.reapSettledPanes();
+        if (this.config.closeOnSettle) await this.reapSettledPanes();
         await this.events.ensurePanes(
           this.list()
             .filter(isLive)
@@ -240,16 +240,55 @@ export class Orchestrator {
       if (!this.isReapCandidate(run)) continue;
       const second = await this.settledStatus(run);
       if (!second || !isCompleted(second)) continue;
-      try {
-        await this.runtime.closePane(run.paneId);
-      } catch {
-        continue;
-      }
-      run.state = "stopped";
-      run.updatedAt = Date.now();
-      this.dropPending(run.id);
-      this.save(run);
+      if (await this.closeSettledPane(run)) continue;
     }
+  }
+
+  /**
+   * User-requested bulk close of Herdr `done` panes. Skips interactive,
+   * blocked, in-flight, and panes that Herdr no longer reports as done.
+   * Age gates do not apply: `/fleet close` is explicit.
+   */
+  async closeDonePanes(): Promise<AgentRun[]> {
+    const closed: AgentRun[] = [];
+    for (const run of this.list()) {
+      if (!this.isDoneCloseCandidate(run)) continue;
+      const live = await this.settledStatus(run);
+      if (live !== "done") continue;
+      if (await this.closeSettledPane(run)) closed.push(run);
+    }
+    return closed;
+  }
+
+  private isDoneCloseCandidate(run: AgentRun): boolean {
+    if (run.interactive) return false;
+    if (run.state !== "done") return false;
+    if (this.pending.has(run.id)) return false;
+    if (this.reapHold.has(run.id)) return false;
+    return true;
+  }
+
+  private async closeOnSettleIfNeeded(run: AgentRun): Promise<void> {
+    if (!this.config.closeOnSettle) return;
+    if (run.interactive) return;
+    if (!isCompleted(run.state)) return;
+    if (this.pending.has(run.id) || this.reapHold.has(run.id)) return;
+    const live = await this.settledStatus(run);
+    if (!live || !isCompleted(live)) return;
+    await this.closeSettledPane(run);
+  }
+
+  private async closeSettledPane(run: AgentRun): Promise<boolean> {
+    try {
+      await this.runtime.closePane(run.paneId);
+    } catch {
+      return false;
+    }
+    run.state = "stopped";
+    run.updatedAt = Date.now();
+    this.dropPending(run.id);
+    this.save(run);
+    return true;
   }
 
   private isReapCandidate(run: AgentRun): boolean {
@@ -754,22 +793,23 @@ export class Orchestrator {
       .catch(() => undefined);
     run.updatedAt = Date.now();
     this.save(run);
-    if (!pending.notify || !this.config.notifyOnComplete) return;
-
-    const preview = (run.lastOutput ?? "(no readable output)").slice(-12_000);
-    const blockedNote =
-      run.state === "blocked"
-        ? "\n\nThe agent is blocked on an approval/question. Inspect the output and escalate to the human; do not answer it automatically."
-        : "";
-    await this.pi.sendMessage(
-      {
-        customType: "fleet-agent-result",
-        content: `Agent ${run.name} (${run.role}) settled as ${run.state}.${blockedNote}\n\n${preview}`,
-        display: true,
-        details: { run },
-      },
-      { deliverAs: "followUp" },
-    );
+    if (pending.notify && this.config.notifyOnComplete) {
+      const preview = (run.lastOutput ?? "(no readable output)").slice(-12_000);
+      const blockedNote =
+        run.state === "blocked"
+          ? "\n\nThe agent is blocked on an approval/question. Inspect the output and escalate to the human; do not answer it automatically."
+          : "";
+      await this.pi.sendMessage(
+        {
+          customType: "fleet-agent-result",
+          content: `Agent ${run.name} (${run.role}) settled as ${run.state}.${blockedNote}\n\n${preview}`,
+          display: true,
+          details: { run },
+        },
+        { deliverAs: "followUp" },
+      );
+    }
+    await this.closeOnSettleIfNeeded(run);
   }
 
   private async notifyBlocked(

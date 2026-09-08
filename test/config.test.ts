@@ -33,7 +33,17 @@ describe("fleet config loading", () => {
     const config = loadConfig(cwd, warnings);
     expect(config.maxConcurrent).toBe(6);
     expect(config.defaultWaitTimeoutMs).toBe(120_000);
+    expect(config.closeOnSettle).toBe(true);
     expect(warnings).toEqual([]);
+  });
+
+  test("closeOnSettle can be disabled from project config", () => {
+    const { cwd } = isolatedDirs();
+    const file = path.join(cwd, ".pi", "herdr-fleet.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ closeOnSettle: false }));
+    const config = loadConfig(cwd);
+    expect(config.closeOnSettle).toBe(false);
   });
 
   test("broken project JSON is ignored and recorded as a warning with the filename", () => {

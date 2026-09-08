@@ -10,6 +10,7 @@ const DEFAULTS: FleetConfig = {
   notifyOnComplete: true,
   recentReadLines: 160,
   defaultWaitTimeoutMs: 120_000,
+  closeOnSettle: true,
   roles: {},
 };
 
@@ -73,6 +74,7 @@ function mergeConfig(base: FleetConfig, raw: Record<string, unknown>): FleetConf
     notifyOnComplete: typeof raw.notifyOnComplete === "boolean" ? raw.notifyOnComplete : base.notifyOnComplete,
     recentReadLines: typeof raw.recentReadLines === "number" ? Math.max(20, Math.floor(raw.recentReadLines)) : base.recentReadLines,
     defaultWaitTimeoutMs: typeof raw.defaultWaitTimeoutMs === "number" ? Math.max(1, Math.floor(raw.defaultWaitTimeoutMs)) : base.defaultWaitTimeoutMs,
+    closeOnSettle: typeof raw.closeOnSettle === "boolean" ? raw.closeOnSettle : base.closeOnSettle,
     roles,
   };
 }

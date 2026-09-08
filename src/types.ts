@@ -41,6 +41,7 @@ export interface FleetConfig {
   notifyOnComplete: boolean;
   recentReadLines: number;
   defaultWaitTimeoutMs: number;
+  closeOnSettle: boolean;
   roles: Record<string, RoleOverride>;
 }
 

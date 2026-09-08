@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents.js";
 import { loadConfig } from "./config.js";
+import { parseFleetCommand } from "./fleet-command.js";
 import { isHerdrAvailable, OUTSIDE_HERDR_WARNING } from "./herdr.js";
 import { Orchestrator, AgentWaitTimeoutError } from "./orchestrator.js";
 import { HerdrRuntime } from "./runtime-herdr.js";
@@ -437,9 +438,20 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
   );
 
   pi.registerCommand("fleet", {
-    description: "Show the current Herdr agent fleet",
-    async handler(_args, ctx) {
+    description:
+      "Show the current Herdr agent fleet. `/fleet close` closes non-interactive done panes.",
+    async handler(args, ctx) {
       activeCtx = ctx;
+      notifyWarnings(ctx, startupWarnings);
+      if (parseFleetCommand(args).action === "close-done") {
+        const closed = await orchestrator.closeDonePanes();
+        const text = closed.length
+          ? `Closed ${closed.length} done pane(s): ${closed.map((run) => `${run.name} [${run.id}]`).join(", ")}`
+          : "No done panes to close.";
+        ctx.ui.notify(text, "info");
+        updateWidget();
+        return;
+      }
       const runs = orchestrator.list();
       const lines = [
         `group=${group}`,
@@ -452,7 +464,6 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
             `${STATE_ICON[r.state]} ${r.id} ${r.name} (${r.role}) ${r.state} ${r.herdrName} ${r.paneId}`,
         ),
       ];
-      notifyWarnings(ctx, startupWarnings);
       ctx.ui.notify(lines.join("\n"), "info");
       updateWidget();
     },
