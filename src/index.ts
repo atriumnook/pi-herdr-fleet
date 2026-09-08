@@ -253,6 +253,8 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
             task: params.task,
             name: params.name,
             model: params.model,
+            // Tool schema lists off|minimal|low|medium|high|xhigh|max; config
+            // and agent frontmatter already drop unknown values.
             thinking: params.thinking as ThinkingLevel | undefined,
             cwd: params.cwd,
             worktree: params.worktree,

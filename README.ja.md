@@ -50,7 +50,7 @@ agent_focus({ target: "planner" })
 
 ## 設定
 
-プロジェクト設定は `.pi/herdr-fleet.json`、ユーザー設定は `~/.pi/agent/herdr-fleet.json` に置きます。
+[`config.example.json`](config.example.json) を `.pi/herdr-fleet.json`（プロジェクト）および／または `~/.pi/agent/herdr-fleet.json`（ユーザー）にコピーします。プロジェクトがユーザーを上書きし、どちらも組み込みデフォルトの上に載ります。`defaultModel` / `defaultThinking` を省略すると、今の Pi セッションの値が使われます。
 
 ```json
 {
@@ -70,7 +70,25 @@ agent_focus({ target: "planner" })
 }
 ```
 
-設定項目は [`config.example.json`](config.example.json) を参照してください。`defaultWaitTimeoutMs`（120000）は、モデルが `timeout_ms` を省略したときの `agent_wait` 上限です。
+| キー | デフォルト | 意味 |
+| --- | --- | --- |
+| `runtime` | `"herdr"` | Herdr のみ対応。 |
+| `defaultModel` | 未設定（Pi セッション） | role に `model` が無いときのフォールバック。 |
+| `defaultThinking` | 未設定（Pi セッション） | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`。 |
+| `maxConcurrent` | `6` | `starting` または `working` の上限。idle / done / blocked は数えない。 |
+| `maxDepth` | `2` | ネスト上限。下記参照。 |
+| `notifyOnComplete` | `true` | 非 interactive のターン完了時に呼び出し元を起こす。 |
+| `recentReadLines` | `160` | `agent_read` と完了通知が読む行数（下限 20）。 |
+| `defaultWaitTimeoutMs` | `120000` | モデルが `timeout_ms` を省略したときの `agent_wait` 上限。 |
+| `roles.<name>` | `{}` | role ごとの `model` / `thinking` / `worktree` / `interactive` / `spawning`。 |
+
+### ネスト（`spawning` × `maxDepth`）
+
+- この拡張を読み込んだ Pi セッションが depth `0`。spawn するたびに `parentDepth + 1`。
+- 今のセッションの depth が `>= maxDepth` なら spawn は拒否される。デフォルト `2` では root → child → grandchild までで、grandchild は spawn できない。
+- 子 agent が `agent_spawn` を持てるのは、その role が `spawning: true`（設定または agent markdown）**かつ** `parentDepth + 1 < maxDepth` のときだけ。
+- bundled の `scout` / `planner` / `worker` / `reviewer` は `spawning: false` なので、role を上書きしない限り spawn できるのは root セッションだけ。
+- `interactive: true`（bundled の `planner`）は人間操作用に pane を残す。完了しても呼び出し元を自動では起こさず、pane も自動 close しない。
 
 ## ロール
 
@@ -81,7 +99,7 @@ agent_focus({ target: "planner" })
 | `worker` | 実装と検証 |
 | `reviewer` | 独立したコードレビュー |
 
-カスタム role は `.pi/agents/` または `~/.pi/agent/agents/` に追加できます。
+カスタム role は `.pi/agents/` または `~/.pi/agent/agents/` に追加できます（プロジェクト優先）。frontmatter は `roles.<name>` と同じキー（`model` / `thinking` / `worktree` / `interactive` / `spawning`）を受け付けます。
 
 worktree isolation は opt-in で、role または spawn ごとに有効化できます。
 

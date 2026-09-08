@@ -50,7 +50,7 @@ agent_focus({ target: "planner" })
 
 ## Configuration
 
-Project settings go in `.pi/herdr-fleet.json`. User settings go in `~/.pi/agent/herdr-fleet.json`.
+Copy [`config.example.json`](config.example.json) to `.pi/herdr-fleet.json` (project) and/or `~/.pi/agent/herdr-fleet.json` (user). Project overlays user; both overlay built-in defaults. Omit `defaultModel` / `defaultThinking` to inherit the current Pi session.
 
 ```json
 {
@@ -70,7 +70,25 @@ Project settings go in `.pi/herdr-fleet.json`. User settings go in `~/.pi/agent/
 }
 ```
 
-See [`config.example.json`](config.example.json) for the available options. `defaultWaitTimeoutMs` (120000) bounds `agent_wait` when the model omits `timeout_ms`.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `runtime` | `"herdr"` | Only Herdr is supported. |
+| `defaultModel` | unset (Pi session) | Fallback when the role has no `model`. |
+| `defaultThinking` | unset (Pi session) | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. |
+| `maxConcurrent` | `6` | Caps agents in `starting` or `working`. Idle, done, and blocked do not count. |
+| `maxDepth` | `2` | Nesting limit; see below. |
+| `notifyOnComplete` | `true` | Wake the caller when a non-interactive turn settles. |
+| `recentReadLines` | `160` | Lines fetched by `agent_read` and completion notify (minimum 20). |
+| `defaultWaitTimeoutMs` | `120000` | `agent_wait` limit when the model omits `timeout_ms`. |
+| `roles.<name>` | `{}` | Per-role `model`, `thinking`, `worktree`, `interactive`, `spawning`. |
+
+### Nesting (`spawning` × `maxDepth`)
+
+- The Pi session that loaded this extension is depth `0`. Each spawn is `parentDepth + 1`.
+- Spawn is refused when the current session's depth is `>= maxDepth`. Default `2` allows root → child → grandchild; the grandchild cannot spawn.
+- A spawned agent gets `agent_spawn` only if its role has `spawning: true` (config or agent markdown) **and** `parentDepth + 1 < maxDepth`.
+- Bundled `scout`, `planner`, `worker`, and `reviewer` set `spawning: false`, so only the root session can spawn unless you override a role.
+- `interactive: true` (bundled `planner`) keeps the pane for humans: no automatic caller wake-up, and the pane is not auto-closed when the turn settles.
 
 ## Roles
 
@@ -81,7 +99,7 @@ See [`config.example.json`](config.example.json) for the available options. `def
 | `worker` | Implementation and verification |
 | `reviewer` | Independent code review |
 
-Custom roles can be added under `.pi/agents/` or `~/.pi/agent/agents/`.
+Custom roles can be added under `.pi/agents/` or `~/.pi/agent/agents/` (project wins). Frontmatter accepts the same keys as `roles.<name>`: `model`, `thinking`, `worktree`, `interactive`, `spawning`.
 
 Worktree isolation is opt-in and can be enabled per role or spawn.
 

@@ -326,6 +326,10 @@ export class Orchestrator {
       override.interactive ??
       definition.interactive ??
       false;
+    // Child may spawn only if the role sets spawning: true AND the child's
+    // depth (parent+1) is still below maxDepth. Root is depth 0; bundled
+    // roles default spawning to false, so only the root session can spawn
+    // unless a role override turns it on.
     const canSpawn =
       (override.spawning ?? definition.spawning ?? false) &&
       this.depth + 1 < this.config.maxDepth;

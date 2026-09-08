@@ -1,5 +1,7 @@
 {
   "runtime": "herdr",
+  "defaultModel": "provider/default-model",
+  "defaultThinking": "medium",
   "maxConcurrent": 6,
   "maxDepth": 2,
   "notifyOnComplete": true,
@@ -9,22 +11,30 @@
     "scout": {
       "model": "provider/fast-model",
       "thinking": "medium",
-      "worktree": false
+      "worktree": false,
+      "interactive": false,
+      "spawning": false
     },
     "planner": {
       "model": "provider/strong-model",
       "thinking": "high",
-      "worktree": false
+      "worktree": false,
+      "interactive": true,
+      "spawning": false
     },
     "worker": {
       "model": "provider/strong-model",
       "thinking": "high",
-      "worktree": false
+      "worktree": false,
+      "interactive": false,
+      "spawning": false
     },
     "reviewer": {
       "model": "provider/review-model",
       "thinking": "high",
-      "worktree": false
+      "worktree": false,
+      "interactive": false,
+      "spawning": false
     }
   }
 }
