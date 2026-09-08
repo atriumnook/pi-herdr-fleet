@@ -27,6 +27,15 @@ function slug(value: string, max = 20): string {
 // trailing newline, to one PIPE_BUF-sized write.
 export const MAX_REGISTRY_RECORD_BYTES = 4096;
 
+/** Rewrite the log to latest-per-run once it grows past this many bytes. */
+export const COMPACT_MIN_BYTES = 16 * 1024;
+
+/** Compact only when the file is at least this multiple of the latest-state size. */
+export const COMPACT_MIN_RATIO = 3;
+
+const LOCK_WAIT_MS = 5;
+const LOCK_STALE_MS = 2_000;
+
 export function makeId(): string {
   return crypto.randomBytes(4).toString("hex");
 }
@@ -87,6 +96,115 @@ function encodeLine(event: RegistryEvent): Buffer {
   return buf;
 }
 
+function eventKey(event: RegistryEvent): string {
+  return `${event.group}\0${event.run.id}`;
+}
+
+function parseEvents(text: string): RegistryEvent[] {
+  const events: RegistryEvent[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line) as RegistryEvent;
+      if (typeof event.group === "string" && event.run?.id) events.push(event);
+    } catch {
+      // Ignore a malformed line; one bad write must not poison the cache.
+    }
+  }
+  return events;
+}
+
+function latestEvents(events: RegistryEvent[]): RegistryEvent[] {
+  const latest = new Map<string, RegistryEvent>();
+  for (const event of events) latest.set(eventKey(event), event);
+  return [...latest.values()].sort((a, b) => {
+    const started = a.run.startedAt - b.run.startedAt;
+    if (started !== 0) return started;
+    return a.run.id.localeCompare(b.run.id);
+  });
+}
+
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readLockPid(lockPath: string): number | undefined {
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8").trim();
+    const pid = Number.parseInt(raw, 10);
+    return Number.isFinite(pid) && pid > 0 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function lockPathFor(filePath: string): string {
+  return `${filePath}.lock`;
+}
+
+function tmpPathFor(filePath: string): string {
+  return `${filePath}.rewind`;
+}
+
+/**
+ * Serialize append + rewind across processes. O_APPEND alone cannot make a
+ * rename-over rewrite safe: a writer that opens the path before rename would
+ * append onto the orphaned inode.
+ */
+function withRegistryLock(filePath: string, fn: () => void): void {
+  const lockPath = lockPathFor(filePath);
+  const started = Date.now();
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      try {
+        fs.writeSync(fd, Buffer.from(`${process.pid}\n`));
+        fn();
+        return;
+      } finally {
+        fs.closeSync(fd);
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          // Another process stole a stale lock; the unlink is best-effort.
+        }
+      }
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== "EEXIST") throw error;
+      const pid = readLockPid(lockPath);
+      const stale =
+        (pid !== undefined && !pidAlive(pid)) ||
+        (pid === undefined && Date.now() - started >= LOCK_STALE_MS);
+      if (stale) {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          // Lost the race to another waiter.
+        }
+        continue;
+      }
+      sleepMs(LOCK_WAIT_MS);
+    }
+  }
+}
+
+function mergeRun(previous: AgentRun | undefined, next: AgentRun): AgentRun {
+  if (previous?.lastOutput && next.lastOutput === undefined) {
+    return { ...next, lastOutput: previous.lastOutput };
+  }
+  return next;
+}
+
 export class RunRegistry {
   private runs = new Map<string, AgentRun>();
   private parseOffset = 0; // byte offset just past the last fully parsed line
@@ -110,13 +228,16 @@ export class RunRegistry {
       run,
     };
     const line = encodeLine(event);
-    const fd = fs.openSync(this.filePath, "a", 0o600);
-    try {
-      // One writeSync: O_APPEND plus a buffer <= PIPE_BUF is the atomic unit.
-      fs.writeSync(fd, line, 0, line.length);
-    } finally {
-      fs.closeSync(fd);
-    }
+    withRegistryLock(this.filePath, () => {
+      const fd = fs.openSync(this.filePath, "a", 0o600);
+      try {
+        // One writeSync: O_APPEND plus a buffer <= PIPE_BUF is the atomic unit.
+        fs.writeSync(fd, line, 0, line.length);
+      } finally {
+        fs.closeSync(fd);
+      }
+      this.rewindIfNeeded();
+    });
   }
 
   all(): AgentRun[] {
@@ -137,49 +258,145 @@ export class RunRegistry {
       return this.sorted();
     }
     if (stat.size < this.parseOffset) {
-      // The file was replaced or truncated; start over.
+      // Rewind/truncate replaced the file. Keep lastOutput (never on disk for
+      // new records) while dropping runs that are no longer present.
+      const outputs = this.snapshotOutputs();
       this.runs.clear();
       this.parseOffset = 0;
+      this.applyCompleteLinesFrom(0, outputs);
+      this.statMtimeMs = stat.mtimeMs;
+      this.statSize = stat.size;
+      return this.sorted();
     }
     this.statMtimeMs = stat.mtimeMs;
     this.statSize = stat.size;
     if (stat.size === this.parseOffset) return this.sorted();
+    this.applyCompleteLinesFrom(this.parseOffset);
+    return this.sorted();
+  }
+
+  private snapshotOutputs(): Map<string, string> {
+    const outputs = new Map<string, string>();
+    for (const [id, run] of this.runs) {
+      if (run.lastOutput) outputs.set(id, run.lastOutput);
+    }
+    return outputs;
+  }
+
+  private applyCompleteLinesFrom(
+    start: number,
+    outputs?: Map<string, string>,
+  ): void {
     let handle: number;
     try {
       handle = fs.openSync(this.filePath, "r");
     } catch {
-      return this.sorted();
+      return;
     }
     try {
-      const length = stat.size - this.parseOffset;
+      const actual = fs.fstatSync(handle).size;
+      let from = start;
+      let restore = outputs;
+      if (actual < from) {
+        restore = restore ?? this.snapshotOutputs();
+        this.runs.clear();
+        from = 0;
+      }
+      const length = actual - from;
+      if (length <= 0) {
+        this.parseOffset = from;
+        return;
+      }
       const buffer = Buffer.alloc(length);
-      fs.readSync(handle, buffer, 0, length, this.parseOffset);
+      fs.readSync(handle, buffer, 0, length, from);
       // Only consume up to the last complete line; a partial trailing write is
       // re-parsed once its newline arrives.
       const newline = buffer.lastIndexOf(0x0a);
-      if (newline >= 0) {
-        const complete = buffer.subarray(0, newline + 1).toString("utf8");
-        this.parseOffset += newline + 1;
-        for (const line of complete.split("\n")) {
-          if (!line.trim()) continue;
-          try {
-            const event = JSON.parse(line) as RegistryEvent;
-            if (event.group === this.group && event.run?.id) {
-              const previous = this.runs.get(event.run.id);
-              if (previous?.lastOutput && event.run.lastOutput === undefined) {
-                event.run.lastOutput = previous.lastOutput;
-              }
-              this.runs.set(event.run.id, event.run);
-            }
-          } catch {
-            // Ignore a malformed line; one bad write must not poison the cache.
-          }
-        }
+      if (newline < 0) return;
+      const complete = buffer.subarray(0, newline + 1).toString("utf8");
+      this.parseOffset = from + newline + 1;
+      for (const event of parseEvents(complete)) {
+        if (event.group !== this.group) continue;
+        const previous = this.runs.get(event.run.id);
+        const restored =
+          restore?.get(event.run.id) && event.run.lastOutput === undefined
+            ? { ...event.run, lastOutput: restore.get(event.run.id) }
+            : event.run;
+        this.runs.set(event.run.id, mergeRun(previous, restored));
       }
     } finally {
       fs.closeSync(handle);
     }
-    return this.sorted();
+  }
+
+  /**
+   * Collapse history to one record per (group, run id). Callers already hold
+   * the registry lock so a concurrent upsert cannot append onto a stale inode
+   * during rename. Readers that still have a larger parseOffset see size shrink
+   * and rebuild from byte 0.
+   */
+  private rewindIfNeeded(): void {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(this.filePath);
+    } catch {
+      return;
+    }
+    if (stat.size < COMPACT_MIN_BYTES) return;
+
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.filePath, "utf8");
+    } catch {
+      return;
+    }
+    const compactEvents = latestEvents(parseEvents(raw));
+    const parts = compactEvents.map((event) => encodeLine(event));
+    const compactSize = parts.reduce((sum, part) => sum + part.length, 0);
+    if (stat.size < compactSize * COMPACT_MIN_RATIO) return;
+    if (compactSize >= stat.size) return;
+
+    const tmp = tmpPathFor(this.filePath);
+    try {
+      const fd = fs.openSync(tmp, "w", 0o600);
+      try {
+        for (const part of parts) fs.writeSync(fd, part, 0, part.length);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(tmp, this.filePath);
+    } catch {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // Leftover tmp is harmless; the live log is unchanged.
+      }
+      return;
+    }
+
+    const outputs = this.snapshotOutputs();
+    this.runs.clear();
+    for (const event of compactEvents) {
+      if (event.group !== this.group) continue;
+      this.runs.set(event.run.id, mergeRun(undefined, event.run));
+    }
+    for (const [id, output] of outputs) {
+      const run = this.runs.get(id);
+      if (run && run.lastOutput === undefined) {
+        run.lastOutput = output;
+      }
+    }
+    this.parseOffset = compactSize;
+    try {
+      const next = fs.statSync(this.filePath);
+      this.parseOffset = next.size;
+      this.statMtimeMs = next.mtimeMs;
+      this.statSize = next.size;
+    } catch {
+      this.statMtimeMs = -1;
+      this.statSize = -1;
+    }
   }
 
   private sorted(): AgentRun[] {

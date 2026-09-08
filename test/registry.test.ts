@@ -5,6 +5,8 @@ import { describe, expect, test } from "bun:test";
 import {
   makeHerdrName,
   MAX_REGISTRY_RECORD_BYTES,
+  COMPACT_MIN_BYTES,
+  COMPACT_MIN_RATIO,
   RunRegistry,
 } from "../src/registry.js";
 import type { AgentRun } from "../src/types.js";
@@ -161,5 +163,95 @@ describe("append-only registry caching", () => {
     expect(a.all()).toHaveLength(1);
     fs.writeFileSync(file, "");
     expect(a.all()).toHaveLength(0);
+  });
+});
+
+describe("registry compaction", () => {
+  function jsonlLines(file: string): string[] {
+    return fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .filter((line) => line.trim());
+  }
+
+  test("rewinds a long history to the latest state per run", () => {
+    const { file, a, b } = tempRegistry();
+    const lastOutput = "preview from writer";
+    for (let i = 0; i < 30; i++) {
+      a.upsert(
+        run({
+          lastOutput,
+          lastError: "e".repeat(2000),
+          state: i === 29 ? "done" : "working",
+          updatedAt: i + 1,
+        }),
+      );
+    }
+    const lines = jsonlLines(file);
+    expect(lines.length).toBeLessThan(12);
+    expect(fs.statSync(file).size).toBeLessThan(COMPACT_MIN_BYTES * COMPACT_MIN_RATIO);
+    for (const line of lines) {
+      expect(Buffer.byteLength(`${line}\n`, "utf8")).toBeLessThanOrEqual(
+        MAX_REGISTRY_RECORD_BYTES,
+      );
+      JSON.parse(line);
+    }
+    expect(a.all()).toHaveLength(1);
+    expect(a.all()[0]?.state).toBe("done");
+    expect(a.all()[0]?.lastOutput).toBe(lastOutput);
+    expect(b.all()).toHaveLength(1);
+    expect(b.all()[0]?.state).toBe("done");
+    expect(b.all()[0]?.lastOutput).toBeUndefined();
+  });
+
+  test("incremental readers rebuild after a rewind shrinks the file", () => {
+    const { file, a, b } = tempRegistry();
+    a.upsert(run({ state: "starting" }));
+    expect(b.all()[0]?.state).toBe("starting");
+    for (let i = 0; i < 30; i++) {
+      a.upsert(
+        run({
+          lastError: "e".repeat(2000),
+          state: i === 29 ? "idle" : "working",
+          updatedAt: i + 2,
+        }),
+      );
+    }
+    expect(fs.statSync(file).size).toBeLessThan(COMPACT_MIN_BYTES * 2);
+    expect(b.all()[0]?.state).toBe("idle");
+    expect(b.all()).toHaveLength(1);
+  });
+
+  test("rewind keeps the latest record for every group in the file", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-registry-"));
+    const file = path.join(dir, "runs.jsonl");
+    const a = new RunRegistry(file, "fleet-a");
+    const c = new RunRegistry(file, "fleet-c");
+    c.upsert(run({ id: "ccccccc1", name: "Other", herdrName: "fleet-other-1" }));
+    for (let i = 0; i < 30; i++) {
+      a.upsert(
+        run({
+          lastError: "e".repeat(2000),
+          state: i === 29 ? "done" : "working",
+          updatedAt: i + 1,
+        }),
+      );
+    }
+    expect(c.all()).toHaveLength(1);
+    expect(c.all()[0]?.id).toBe("ccccccc1");
+    expect(a.all()[0]?.state).toBe("done");
+    expect(jsonlLines(file).length).toBeLessThan(12);
+  });
+
+  test("preserves lastOutput when a shrink rebuilds the incremental cache", () => {
+    const { file, a } = tempRegistry();
+    a.upsert(run({ lastOutput: "keep me", lastError: "e".repeat(2000) }));
+    const latest = jsonlLines(file)[0];
+    expect(latest).toBeDefined();
+    fs.appendFileSync(file, `${"z".repeat(200)}\n`);
+    expect(a.all()[0]?.lastOutput).toBe("keep me");
+    fs.writeFileSync(file, `${latest}\n`);
+    expect(a.all()).toHaveLength(1);
+    expect(a.all()[0]?.lastOutput).toBe("keep me");
   });
 });

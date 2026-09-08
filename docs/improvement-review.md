@@ -100,7 +100,7 @@
 - **Where:** `src/registry.ts`（`appendFileSync`、`MAX_STORED_OUTPUT = 4000`）
 - **Why:** POSIX の O_APPEND 原子性はだいたい `PIPE_BUF`（4KiB）。`lastOutput` 4000 文字にメタデータを足すと 1 レコードがそれを超える。ネスト spawn（別プロセス）が同時 upsert すると行が壊れ、増分パーサはその行を永久に飛ばす。ファイル自体も compaction 無し。
 - **Direction:** `lastOutput` を registry に書かない（finalize は同プロセスのメモリで足りる）、またはレコードを 4KiB 未満に保つ。長セッション用に「最新状態だけ」への周期 rewind は任意。クロスプロセスの同時実行予算は、デフォルト role が `spawning: false` なので急がない。
-- **Status:** この PR で `lastOutput` を JSONL に書かない。1 レコード（改行込み）を `PIPE_BUF`（4096）以下に収め、O_APPEND の単一 `writeSync` にする。書き込み側プロセスのメモリには `lastOutput` を残す。旧レコード（`lastOutput` 付き）は読める。compaction / rewind は未着手。
+- **Status:** この PR で `lastOutput` を JSONL に書かない。1 レコード（改行込み）を `PIPE_BUF`（4096）以下に収め、O_APPEND の単一 `writeSync` にする。書き込み側プロセスのメモリには `lastOutput` を残す。旧レコード（`lastOutput` 付き）は読める。ファイルが 16KiB を超え、かつ最新状態の 3 倍以上なら、排他ロック下で「(group, run id) ごとの最新 1 行」に rewind する。増分パーサは size 縮小で byte 0 から作り直す。`lastOutput` は rewind/truncate 後も書き込み側メモリに残す。
 
 ### 8. 完了 pane が残り、blocked フローはまだ E2E されていない
 
@@ -129,13 +129,12 @@
 2. ~~項目 2 の trailing sync と項目 3 の subscriber ゲート~~ **済み**（この PR）
 3. ~~項目 5 の警告~~ **済み**（この PR）
 4. ~~項目 6 の wait timeout / abort~~ **済み**（この PR）
-5. ~~項目 7 の JSONL / PIPE_BUF~~ **済み**（この PR）
+5. ~~項目 7 の JSONL / PIPE_BUF~~ **済み**（この PR）。compaction / rewind も済み。
 6. ~~項目 8 の完了 pane 回収~~ **済み**（この PR）
 7. ~~項目 9 の設定 DX（example / README）~~ **済み**（この PR）
 
 このレビューの P0–P2 ドキュメント項目は一通り入れた。残るのは後回しにした実装と E2E:
 
-- JSONL compaction / rewind（項目 7）
 - `closeOnSettle` と `/fleet` の done 一括 close、blocked E2E（項目 8）
 - spawn 時の不正 `thinking` 拒否（項目 9 の Direction）
 - `spawn` / `prompt` の AbortSignal（項目 6、wait 以外）
