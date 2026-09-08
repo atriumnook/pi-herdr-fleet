@@ -59,6 +59,7 @@ export class HerdrEventSubscriber {
   private reconnectDelayMs = 250;
   private connected = false;
   private connecting = false;
+  private panesDirty = false;
   private reconfigure: Promise<void> = Promise.resolve();
 
   constructor(
@@ -79,15 +80,13 @@ export class HerdrEventSubscriber {
 
   start(): Promise<void> {
     this.running = true;
-    this.reconfigure = this.reconfigure
-      .catch(() => undefined)
-      .then(() => this.reconnect());
-    return this.reconfigure;
+    return this.enqueueReconnect();
   }
 
   stop(): void {
     this.running = false;
     this.generation += 1;
+    this.panesDirty = false;
     this.socket?.destroy();
     this.socket = undefined;
     this.connected = false;
@@ -99,21 +98,41 @@ export class HerdrEventSubscriber {
     this.panes = next;
     if (!this.running) return Promise.resolve();
     // While a connection attempt is in flight, additional ensurePanes calls
-    // (registry watcher fires on every save) must be no-ops. Chaining another
-    // reconnect destroys the in-flight socket before the handshake completes,
-    // which wedges `connected=false` forever and storms the server.
+    // (registry watcher fires on every save) must not chain another reconnect:
+    // that destroys the in-flight socket before the handshake completes, which
+    // wedges `connected=false` forever and storms the server. Update this.panes
+    // (already done) and mark dirty so the handshake loop follow-up subscribes
+    // to the latest set.
     if (!changed && (this.connected || this.connecting))
       return this.reconfigure;
-    if (this.connecting) return this.reconfigure;
+    return this.enqueueReconnect().catch((error) => {
+      // Sync callers (registry watcher, socket events) fire-and-forget this
+      // promise; a failed reconfiguration must surface as onError, not as an
+      // unhandled rejection that crashes the process.
+      this.guardError(error);
+    });
+  }
+
+  /**
+   * Single-flight reconnect used by start(), ensurePanes(), and socket close.
+   * Concurrent callers set panesDirty and await the same chain; after each
+   * handshake, if the subscribed set is stale, loop rather than overlapping
+   * sockets.
+   */
+  private enqueueReconnect(): Promise<void> {
+    if (!this.running) return Promise.resolve();
+    if (this.connecting) {
+      this.panesDirty = true;
+      return this.reconfigure;
+    }
     this.connecting = true;
     this.reconfigure = this.reconfigure
       .catch(() => undefined)
-      .then(() => this.reconnect())
-      .catch((error) => {
-        // Sync callers (registry watcher, socket events) fire-and-forget this
-        // promise; a failed reconfiguration must surface as onError, not as an
-        // unhandled rejection that crashes the process.
-        this.guardError(error);
+      .then(async () => {
+        do {
+          this.panesDirty = false;
+          await this.reconnect();
+        } while (this.running && this.panesDirty);
       })
       .finally(() => {
         this.connecting = false;
@@ -134,6 +153,7 @@ export class HerdrEventSubscriber {
     this.socket?.destroy();
     this.connected = false;
     this.buffer = "";
+    let subscribed = new Set<string>();
 
     await new Promise<void>((resolve, reject) => {
       const socket = net.createConnection(socketPath);
@@ -157,11 +177,12 @@ export class HerdrEventSubscriber {
 
       socket.setEncoding("utf8");
       socket.on("connect", () => {
+        subscribed = new Set(this.panes);
         const subscriptions: Array<Record<string, string>> = [
           { type: "pane.exited" },
           { type: "pane.closed" },
           { type: "pane.moved" },
-          ...[...this.panes].map((paneId) => ({
+          ...[...subscribed].map((paneId) => ({
             type: "pane.agent_status_changed",
             pane_id: paneId,
           })),
@@ -240,12 +261,13 @@ export class HerdrEventSubscriber {
           this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 5000);
           setTimeout(() => {
             if (!this.running || generation !== this.generation) return;
-            void this.reconnect().catch((error) => this.guardError(error));
+            void this.enqueueReconnect().catch((error) => this.guardError(error));
           }, delay);
         } catch (guarded) {
           this.guardError(guarded);
         }
       });
     });
+    if (!sameSet(subscribed, this.panes)) this.panesDirty = true;
   }
 }

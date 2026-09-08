@@ -6,17 +6,18 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { findAgent } from "./agents.js";
-import { HerdrCommandError } from "./herdr.js";
+import { abortError, HerdrCommandError, isAbortError } from "./herdr.js";
 import { HerdrEventSubscriber, type HerdrSocketEvent } from "./herdr-events.js";
 import { makeHerdrName, makeId, type RunRegistry } from "./registry.js";
 import type { AgentRuntime } from "./runtime.js";
-import type {
-  AgentDefinition,
-  AgentRun,
-  AgentState,
-  FleetConfig,
-  SpawnRequest,
-  ThinkingLevel,
+import {
+  requireThinkingLevel,
+  type AgentDefinition,
+  type AgentRun,
+  type AgentState,
+  type FleetConfig,
+  type SpawnRequest,
+  type ThinkingLevel,
 } from "./types.js";
 
 interface PendingTurn {
@@ -67,10 +68,26 @@ function isLive(run: AgentRun): boolean {
   return run.state !== "stopped" && run.state !== "failed";
 }
 
+/** Skip prune/reap while a pane may still be appearing or flipping TUI state. */
+const MIN_RUN_AGE_MS = 10_000;
+const PANE_RECHECK_MS = 300;
+
 function shortModel(model?: string): string {
   if (!model) return "inherit";
   const slash = model.lastIndexOf("/");
   return slash >= 0 ? model.slice(slash + 1) : model;
+}
+
+export class AgentWaitTimeoutError extends Error {
+  constructor(
+    readonly run: AgentRun,
+    readonly timeoutMs: number,
+  ) {
+    super(
+      `Wait timed out after ${timeoutMs}ms; ${run.name} is still ${run.state}.`,
+    );
+    this.name = "AgentWaitTimeoutError";
+  }
 }
 
 export class Orchestrator {
@@ -83,9 +100,12 @@ export class Orchestrator {
   >();
   private spawnGate: Promise<void> = Promise.resolve();
   private syncInFlight?: Promise<void>;
+  private syncQueued = false;
   private eventsStarted = false;
   private eventState: "connecting" | "connected" | "reconnecting" | "stopped" =
     "stopped";
+  /** Run ids that must survive reap (e.g. agent_send before pending is armed). */
+  private readonly reapHold = new Set<string>();
   private readonly events: HerdrEventSubscriber;
 
   constructor(
@@ -133,6 +153,7 @@ export class Orchestrator {
     // pane with pane_not_found, which would otherwise wedge the subscriber in
     // a reconnect loop and permanently leak concurrency slots.
     await this.pruneOrphanRuns();
+    if (this.config.closeOnSettle) await this.reapSettledPanes();
     await this.events.ensurePanes(
       this.list()
         .filter(isLive)
@@ -143,6 +164,7 @@ export class Orchestrator {
 
   stopEvents(): void {
     this.eventsStarted = false;
+    this.syncQueued = false;
     this.eventState = "stopped";
     for (const timer of this.settleChecks.values()) clearTimeout(timer);
     this.settleChecks.clear();
@@ -152,20 +174,36 @@ export class Orchestrator {
 
   async syncEvents(): Promise<void> {
     if (!this.eventsStarted) return;
-    // Registry writes fire the watcher on every save; coalesce overlapping
-    // syncs so a write burst cannot pile up herdr CLI round-trips.
-    if (this.syncInFlight) return this.syncInFlight;
-    this.syncInFlight = (async () => {
-      await this.pruneOrphanRuns();
-      await this.events.ensurePanes(
-        this.list()
-          .filter(isLive)
-          .map((run) => run.paneId),
-      );
-    })().finally(() => {
-      this.syncInFlight = undefined;
+    // Registry writes fire the watcher on every save. An in-flight sync that
+    // already snapshotted list() would otherwise drop panes a child process
+    // just appended; mark dirty and loop so the coalesced callers wait for
+    // the trailing prune + ensurePanes.
+    if (this.syncInFlight) {
+      this.syncQueued = true;
+      return this.syncInFlight;
+    }
+    // Store the raw run promise — not a .finally() wrapper. Chaining
+    // `syncInFlight.then(() => this.syncEvents())` onto a finally-wrapped
+    // promise turns into a microtask loop: finally clears the slot, the
+    // then starts another sync, and tests hang.
+    const run = (async () => {
+      do {
+        this.syncQueued = false;
+        if (!this.eventsStarted) break;
+        await this.pruneOrphanRuns();
+        if (this.config.closeOnSettle) await this.reapSettledPanes();
+        await this.events.ensurePanes(
+          this.list()
+            .filter(isLive)
+            .map((item) => item.paneId),
+        );
+      } while (this.syncQueued);
+    })();
+    this.syncInFlight = run;
+    void run.finally(() => {
+      if (this.syncInFlight === run) this.syncInFlight = undefined;
     });
-    return this.syncInFlight;
+    return run;
   }
 
   /**
@@ -177,14 +215,109 @@ export class Orchestrator {
    */
   private async pruneOrphanRuns(): Promise<void> {
     for (const run of this.list().filter(isLive)) {
-      if (Date.now() - run.startedAt < 10_000) continue;
+      if (Date.now() - run.startedAt < MIN_RUN_AGE_MS) continue;
       if (!(await this.paneGone(run.paneId))) continue;
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await new Promise((resolve) => setTimeout(resolve, PANE_RECHECK_MS));
       if (!(await this.paneGone(run.paneId))) continue;
       run.state = "stopped";
       run.updatedAt = Date.now();
-      this.pending.delete(run.id);
+      this.dropPending(run.id);
       this.save(run);
+    }
+  }
+
+  /**
+   * Non-interactive idle/done panes occupy Herdr layout after the turn has
+   * settled and no follow-up is pending. Close them the same way we prune
+   * orphans: never young runs, never interactive/blocked/in-flight, and
+   * re-query Herdr before destroying the pane.
+   */
+  private async reapSettledPanes(): Promise<void> {
+    for (const run of this.list()) {
+      if (!this.isReapCandidate(run)) continue;
+      const first = await this.settledStatus(run);
+      if (!first || !isCompleted(first)) continue;
+      await new Promise((resolve) => setTimeout(resolve, PANE_RECHECK_MS));
+      if (!this.isReapCandidate(run)) continue;
+      const second = await this.settledStatus(run);
+      if (!second || !isCompleted(second)) continue;
+      if (await this.closeSettledPane(run)) continue;
+    }
+  }
+
+  /**
+   * User-requested bulk close of Herdr `done` panes. Skips interactive,
+   * blocked, in-flight, and panes that Herdr no longer reports as done.
+   * Age gates do not apply: `/fleet close` is explicit.
+   */
+  async closeDonePanes(): Promise<AgentRun[]> {
+    const closed: AgentRun[] = [];
+    for (const run of this.list()) {
+      if (!this.isDoneCloseCandidate(run)) continue;
+      const live = await this.settledStatus(run);
+      if (live !== "done") continue;
+      if (await this.closeSettledPane(run)) closed.push(run);
+    }
+    return closed;
+  }
+
+  private isDoneCloseCandidate(run: AgentRun): boolean {
+    if (run.interactive) return false;
+    if (run.state !== "done") return false;
+    if (this.pending.has(run.id)) return false;
+    if (this.reapHold.has(run.id)) return false;
+    return true;
+  }
+
+  private async closeOnSettleIfNeeded(run: AgentRun): Promise<void> {
+    if (!this.config.closeOnSettle) return;
+    if (run.interactive) return;
+    if (!isCompleted(run.state)) return;
+    if (this.pending.has(run.id) || this.reapHold.has(run.id)) return;
+    const live = await this.settledStatus(run);
+    if (!live || !isCompleted(live)) return;
+    await this.closeSettledPane(run);
+  }
+
+  private async closeSettledPane(run: AgentRun): Promise<boolean> {
+    try {
+      await this.runtime.closePane(run.paneId);
+    } catch {
+      return false;
+    }
+    run.state = "stopped";
+    run.updatedAt = Date.now();
+    this.dropPending(run.id);
+    this.save(run);
+    return true;
+  }
+
+  private isReapCandidate(run: AgentRun): boolean {
+    if (run.interactive) return false;
+    if (!isCompleted(run.state)) return false;
+    if (this.pending.has(run.id)) return false;
+    if (this.reapHold.has(run.id)) return false;
+    const now = Date.now();
+    if (now - run.startedAt < MIN_RUN_AGE_MS) return false;
+    if (now - run.updatedAt < MIN_RUN_AGE_MS) return false;
+    return true;
+  }
+
+  private async settledStatus(run: AgentRun): Promise<AgentState | undefined> {
+    try {
+      const current = await this.runtime.get(run.herdrName);
+      if (current.status === run.state) return current.status;
+      if (isCompleted(current.status)) {
+        // idle↔done is still settled. Do not bump updatedAt or the age gate
+        // would postpone (and, if no later sync arrives, skip) the reap.
+        run.state = current.status;
+        return current.status;
+      }
+      this.updateState(run, current.status);
+      return current.status;
+    } catch {
+      // Unknown failures must not destroy a pane that may still be useful.
+      return undefined;
     }
   }
 
@@ -196,7 +329,11 @@ export class Orchestrator {
     }
   }
 
-  async spawn(request: SpawnRequest, ctx: ExtensionContext): Promise<AgentRun> {
+  async spawn(
+    request: SpawnRequest,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ): Promise<AgentRun> {
     if (this.depth >= this.config.maxDepth) {
       throw new Error(
         `Agent nesting limit reached: depth=${this.depth}, maxDepth=${this.config.maxDepth}`,
@@ -220,12 +357,14 @@ export class Orchestrator {
       definition.model ??
       this.config.defaultModel ??
       modelFromContext(ctx);
-    const thinking =
-      request.thinking ??
-      override.thinking ??
-      definition.thinking ??
-      this.config.defaultThinking ??
-      this.pi.getThinkingLevel();
+    const thinking = requireThinkingLevel(
+      request.thinking !== undefined
+        ? request.thinking
+        : (override.thinking ??
+          definition.thinking ??
+          this.config.defaultThinking ??
+          this.pi.getThinkingLevel()),
+    );
     const worktree =
       request.worktree ?? override.worktree ?? definition.worktree ?? false;
     const interactive =
@@ -233,6 +372,10 @@ export class Orchestrator {
       override.interactive ??
       definition.interactive ??
       false;
+    // Child may spawn only if the role sets spawning: true AND the child's
+    // depth (parent+1) is still below maxDepth. Root is depth 0; bundled
+    // roles default spawning to false, so only the root session can spawn
+    // unless a role override turns it on.
     const canSpawn =
       (override.spawning ?? definition.spawning ?? false) &&
       this.depth + 1 < this.config.maxDepth;
@@ -278,9 +421,11 @@ export class Orchestrator {
     this.spawnGate = new Promise<void>((resolveGate) => {
       releaseGate = resolveGate;
     });
+    if (signal?.aborted) throw abortError(signal);
     await previousGate;
-    let run: AgentRun;
+    let run: AgentRun | undefined;
     try {
+      if (signal?.aborted) throw abortError(signal);
       const active = this.registry
         .all()
         .filter((r) => r.state === "starting" || r.state === "working");
@@ -289,14 +434,17 @@ export class Orchestrator {
           `Agent concurrency limit reached: ${active.length}/${this.config.maxConcurrent}`,
         );
       }
-      const location = await this.runtime.createLocation({
-        cwd: requestedCwd,
-        label: displayName,
-        worktree,
-        branch,
-        direction: request.direction,
-        env: fleetEnv,
-      });
+      const location = await this.runtime.createLocation(
+        {
+          cwd: requestedCwd,
+          label: displayName,
+          worktree,
+          branch,
+          direction: request.direction,
+          env: fleetEnv,
+        },
+        signal,
+      );
       const now = Date.now();
       run = {
         id,
@@ -319,6 +467,7 @@ export class Orchestrator {
     } finally {
       releaseGate();
     }
+    if (!run) throw new Error("Spawn failed before the pane was recorded.");
 
     // Herdr re-encodes agent arguments through the target shell and rejects
     // multiline argv elements, so the multiline fleet prompt cannot be passed
@@ -332,73 +481,116 @@ export class Orchestrator {
     piArgs.push("--append-system-prompt", promptFile);
 
     try {
-      const started = await this.runtime.start(herdrName, run.paneId, piArgs);
-      run.state = started.status;
-    } catch (error) {
-      if (
-        error instanceof HerdrCommandError &&
-        error.codeName === "agent_not_ready"
-      ) {
-        // Herdr keeps the live agent name when startup reaches a blocked UI.
-        // Do not inject the delegated task through that approval/question.
-        const current = await this.runtime
-          .get(herdrName)
-          .catch(() => ({ status: "unknown" as const }));
-        run.state = current.status;
-        run.lastError =
-          "Agent started but is not ready for prompts; delegated task has not been submitted.";
-      } else {
-        run.state = "failed";
-        run.lastError = error instanceof Error ? error.message : String(error);
-        run.updatedAt = Date.now();
-        this.save(run);
-        // The agent never started; an empty leftover pane would be an orphan.
-        await this.runtime.closePane(run.paneId).catch(() => undefined);
-        void fs.promises.rm(promptFile, { force: true }).catch(() => undefined);
-        throw error;
+      try {
+        const started = await this.runtime.start(
+          herdrName,
+          run.paneId,
+          piArgs,
+          signal,
+        );
+        run.state = started.status;
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        if (
+          error instanceof HerdrCommandError &&
+          error.codeName === "agent_not_ready"
+        ) {
+          // Herdr keeps the live agent name when startup reaches a blocked UI.
+          // Do not inject the delegated task through that approval/question.
+          const current = await this.runtime
+            .get(herdrName)
+            .catch(() => ({ status: "unknown" as const }));
+          run.state = current.status;
+          run.lastError =
+            "Agent started but is not ready for prompts; delegated task has not been submitted.";
+        } else {
+          run.state = "failed";
+          run.lastError = error instanceof Error ? error.message : String(error);
+          run.updatedAt = Date.now();
+          this.save(run);
+          // The agent never started; an empty leftover pane would be an orphan.
+          await this.runtime.closePane(run.paneId).catch(() => undefined);
+          throw error;
+        }
       }
-    }
-    void fs.promises.rm(promptFile, { force: true }).catch(() => undefined);
-    run.updatedAt = Date.now();
-    this.save(run);
+      run.updatedAt = Date.now();
+      this.save(run);
 
-    await this.runtime
-      .reportMetadata({
-        paneId: run.paneId,
-        title: displayName,
-        displayAgent: `${run.role}: ${displayName}`,
-        tokens: {
-          fleet: this.group.replace(/^fleet-/, ""),
-          role: run.role,
-          model: shortModel(run.model),
-        },
-      })
-      .catch(() => undefined);
+      await this.runtime
+        .reportMetadata({
+          paneId: run.paneId,
+          title: displayName,
+          displayAgent: `${run.role}: ${displayName}`,
+          tokens: {
+            fleet: this.group.replace(/^fleet-/, ""),
+            role: run.role,
+            model: shortModel(run.model),
+          },
+        })
+        .catch(() => undefined);
 
-    await this.syncEvents();
-    if (run.state === "blocked" || run.state === "unknown") {
-      // Startup did not reach a safe ready state. The task remains intentionally
-      // unsent; caller can focus/read the pane, resolve it, then agent_send.
+      if (signal?.aborted) throw abortError(signal);
+      await this.syncEvents();
+      if (run.state === "blocked" || run.state === "unknown") {
+        // Startup did not reach a safe ready state. The task remains intentionally
+        // unsent; caller can focus/read the pane, resolve it, then agent_send.
+        return run;
+      }
+      // Await the submission: the tool contract is "returns after launch and
+      // prompt submission", and the concurrency budget counts working runs from
+      // the shared registry — a fire-and-forget submit would let the next spawn
+      // observe the previous agent as still `starting` and exceed the limit.
+      await this.submit(run, request.task, !run.interactive, signal);
       return run;
+    } catch (error) {
+      if (isAbortError(error)) await this.abandonSpawn(run);
+      throw error;
+    } finally {
+      void fs.promises.rm(promptFile, { force: true }).catch(() => undefined);
     }
-    // Await the submission: the tool contract is "returns after launch and
-    // prompt submission", and the concurrency budget counts working runs from
-    // the shared registry — a fire-and-forget submit would let the next spawn
-    // observe the previous agent as still `starting` and exceed the limit.
-    await this.submit(run, request.task, !run.interactive);
-    return run;
   }
 
-  async send(target: string, message: string): Promise<AgentRun> {
+  async send(
+    target: string,
+    message: string,
+    signal?: AbortSignal,
+  ): Promise<AgentRun> {
     const run = this.mustResolve(target);
-    await this.syncEvents();
-    return this.submit(run, message, true);
+    if (signal?.aborted) throw abortError(signal);
+    // syncEvents reaps settled panes. Hold this target first so a follow-up
+    // send cannot close the pane it is about to prompt.
+    this.reapHold.add(run.id);
+    try {
+      await this.syncEvents();
+      if (signal?.aborted) throw abortError(signal);
+      return await this.submit(run, message, true, signal);
+    } finally {
+      this.reapHold.delete(run.id);
+    }
   }
 
-  async wait(target: string, timeoutMs?: number): Promise<AgentRun> {
+  async wait(
+    target: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<AgentRun> {
     const run = this.mustResolve(target);
-    const state = await this.runtime.wait(run.herdrName, timeoutMs);
-    this.updateState(run, state.status);
+    if (signal?.aborted) throw abortError(signal);
+    const timeout = timeoutMs ?? this.config.defaultWaitTimeoutMs;
+    try {
+      const state = await this.runtime.wait(run.herdrName, timeout, signal);
+      this.updateState(run, state.status);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (error instanceof HerdrCommandError && error.codeName === "timeout") {
+        const current = await this.runtime
+          .get(run.herdrName)
+          .catch(() => ({ status: run.state }));
+        this.updateState(run, current.status);
+        throw new AgentWaitTimeoutError(run, timeout);
+      }
+      throw error;
+    }
     const pending = this.pending.get(run.id);
     if (pending?.armed && run.state === "blocked")
       await this.notifyBlocked(run, pending);
@@ -441,7 +633,10 @@ export class Orchestrator {
     run: AgentRun,
     text: string,
     notify: boolean,
+    signal?: AbortSignal,
   ): Promise<AgentRun> {
+    if (signal?.aborted) throw abortError(signal);
+    this.clearSettleCheck(run.id);
     const generation = (this.generations.get(run.id) ?? 0) + 1;
     this.generations.set(run.id, generation);
     const pending: PendingTurn = { notify, armed: false, generation };
@@ -455,7 +650,8 @@ export class Orchestrator {
           .filter(isLive)
           .map((item) => item.paneId),
       );
-      const submitted = await this.runtime.prompt(run.herdrName, text);
+      if (signal?.aborted) throw abortError(signal);
+      const submitted = await this.runtime.prompt(run.herdrName, text, signal);
       // Herdr reports the pre-visual state right after a prompt (usually
       // "idle" because the TUI has not flipped yet). A submitted turn IS
       // running: record it as working so concurrency accounting and the fleet
@@ -469,6 +665,7 @@ export class Orchestrator {
           : submitted.status,
       );
       pending.armed = true;
+      this.clearSettleCheck(run.id);
       if (submitted.status !== "working") {
         // An extremely fast turn can settle while the prompt command is still
         // in flight, or settle before the TUI ever flips to working; in both
@@ -476,14 +673,24 @@ export class Orchestrator {
         // "working" forever. Verify after a short grace period — verifying
         // immediately would mistake pre-visual idle for a settled turn: if the
         // agent already settled, finalize; if it is working, events take over.
+        // The timer is keyed by pending.generation so a follow-up agent_send
+        // cannot inherit an older grace period and treat pre-visual idle as
+        // completion of the new turn.
+        const generation = pending.generation;
         const timer = setTimeout(() => {
           this.settleChecks.delete(run.id);
-          if (this.pending.has(run.id)) void this.reconcileRun(run);
+          if (this.pending.get(run.id)?.generation === generation) {
+            void this.reconcileRun(run);
+          }
         }, 2_500);
         this.settleChecks.set(run.id, timer);
       }
       return run;
     } catch (error) {
+      if (isAbortError(error)) {
+        this.dropPending(run.id);
+        throw error;
+      }
       if (
         error instanceof HerdrCommandError &&
         error.codeName === "agent_blocked"
@@ -491,7 +698,7 @@ export class Orchestrator {
         // Herdr rejected the prompt before sending input. Do not retain this as
         // an in-flight turn; surface the blocker and let the caller retry after
         // the human resolves it.
-        this.pending.delete(run.id);
+        this.dropPending(run.id);
         this.updateState(run, "blocked");
         run.lastOutput = await this.runtime
           .read(run.herdrName, this.config.recentReadLines)
@@ -500,7 +707,7 @@ export class Orchestrator {
         this.save(run);
         return run;
       }
-      this.pending.delete(run.id);
+      this.dropPending(run.id);
       run.state = "failed";
       run.lastError = error instanceof Error ? error.message : String(error);
       run.updatedAt = Date.now();
@@ -545,7 +752,7 @@ export class Orchestrator {
     if (event.event === "pane.exited" || event.event === "pane.closed") {
       run.state = "stopped";
       run.updatedAt = Date.now();
-      this.pending.delete(run.id);
+      this.dropPending(run.id);
       this.save(run);
       await this.syncEvents();
       return;
@@ -590,7 +797,7 @@ export class Orchestrator {
           }
           run.state = "stopped";
           run.updatedAt = Date.now();
-          this.pending.delete(run.id);
+          this.dropPending(run.id);
           this.save(run);
         }
       }
@@ -604,30 +811,52 @@ export class Orchestrator {
     }
   }
 
+  private clearSettleCheck(runId: string): void {
+    const timer = this.settleChecks.get(runId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.settleChecks.delete(runId);
+  }
+
+  private dropPending(runId: string): void {
+    this.pending.delete(runId);
+    this.clearSettleCheck(runId);
+  }
+
+  private async abandonSpawn(run: AgentRun): Promise<void> {
+    this.dropPending(run.id);
+    await this.runtime.closePane(run.paneId).catch(() => undefined);
+    run.state = "stopped";
+    run.lastError = "Spawn cancelled.";
+    run.updatedAt = Date.now();
+    this.save(run);
+  }
+
   private async finalize(run: AgentRun, pending: PendingTurn): Promise<void> {
     if (this.pending.get(run.id)?.generation !== pending.generation) return;
-    this.pending.delete(run.id);
+    this.dropPending(run.id);
     run.lastOutput = await this.runtime
       .read(run.herdrName, this.config.recentReadLines)
       .catch(() => undefined);
     run.updatedAt = Date.now();
     this.save(run);
-    if (!pending.notify || !this.config.notifyOnComplete) return;
-
-    const preview = (run.lastOutput ?? "(no readable output)").slice(-12_000);
-    const blockedNote =
-      run.state === "blocked"
-        ? "\n\nThe agent is blocked on an approval/question. Inspect the output and escalate to the human; do not answer it automatically."
-        : "";
-    await this.pi.sendMessage(
-      {
-        customType: "fleet-agent-result",
-        content: `Agent ${run.name} (${run.role}) settled as ${run.state}.${blockedNote}\n\n${preview}`,
-        display: true,
-        details: { run },
-      },
-      { deliverAs: "followUp" },
-    );
+    if (pending.notify && this.config.notifyOnComplete) {
+      const preview = (run.lastOutput ?? "(no readable output)").slice(-12_000);
+      const blockedNote =
+        run.state === "blocked"
+          ? "\n\nThe agent is blocked on an approval/question. Inspect the output and escalate to the human; do not answer it automatically."
+          : "";
+      await this.pi.sendMessage(
+        {
+          customType: "fleet-agent-result",
+          content: `Agent ${run.name} (${run.role}) settled as ${run.state}.${blockedNote}\n\n${preview}`,
+          display: true,
+          details: { run },
+        },
+        { deliverAs: "followUp" },
+      );
+    }
+    await this.closeOnSettleIfNeeded(run);
   }
 
   private async notifyBlocked(

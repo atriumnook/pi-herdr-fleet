@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import type { AgentDefinition, ThinkingLevel } from "./types.js";
+import { parseThinkingLevel, type AgentDefinition } from "./types.js";
 
 type Frontmatter = {
   name?: unknown;
@@ -21,14 +21,11 @@ function parseList(value: unknown): string[] | undefined {
   return out.length ? out : undefined;
 }
 
-function parseThinking(v: unknown): ThinkingLevel | undefined {
-  const s = String(v);
-  return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(s)
-    ? (s as ThinkingLevel)
-    : undefined;
-}
-
-function loadDir(dir: string, source: AgentDefinition["source"]): AgentDefinition[] {
+function loadDir(
+  dir: string,
+  source: AgentDefinition["source"],
+  warnings?: string[],
+): AgentDefinition[] {
   if (!fs.existsSync(dir)) return [];
   const result: AgentDefinition[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -43,7 +40,7 @@ function loadDir(dir: string, source: AgentDefinition["source"]): AgentDefinitio
         name,
         description,
         model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
-        thinking: parseThinking(frontmatter.thinking),
+        thinking: parseThinkingLevel(frontmatter.thinking),
         tools: parseList(frontmatter.tools),
         worktree: typeof frontmatter.worktree === "boolean" ? frontmatter.worktree : undefined,
         interactive: typeof frontmatter.interactive === "boolean" ? frontmatter.interactive : undefined,
@@ -52,8 +49,12 @@ function loadDir(dir: string, source: AgentDefinition["source"]): AgentDefinitio
         source,
         filePath,
       });
-    } catch {
+    } catch (error) {
       // Invalid agent files are isolated; one bad definition must not break discovery.
+      const detail = error instanceof Error ? error.message : String(error);
+      warnings?.push(
+        `pi-herdr-fleet: skipping invalid agent file ${filePath}: ${detail}`,
+      );
     }
   }
   return result;
@@ -75,16 +76,16 @@ function findNearestProjectDir(cwd: string): string | null {
   }
 }
 
-export function discoverAgents(cwd: string): AgentDefinition[] {
+export function discoverAgents(cwd: string, warnings?: string[]): AgentDefinition[] {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const bundledDir = path.resolve(here, "..", "agents");
   const userDir = path.join(getAgentDir(), "agents");
   const projectDir = findNearestProjectDir(cwd);
 
   const map = new Map<string, AgentDefinition>();
-  for (const agent of loadDir(bundledDir, "bundled")) map.set(agent.name.toLowerCase(), agent);
-  for (const agent of loadDir(userDir, "user")) map.set(agent.name.toLowerCase(), agent);
-  if (projectDir) for (const agent of loadDir(projectDir, "project")) map.set(agent.name.toLowerCase(), agent);
+  for (const agent of loadDir(bundledDir, "bundled", warnings)) map.set(agent.name.toLowerCase(), agent);
+  for (const agent of loadDir(userDir, "user", warnings)) map.set(agent.name.toLowerCase(), agent);
+  if (projectDir) for (const agent of loadDir(projectDir, "project", warnings)) map.set(agent.name.toLowerCase(), agent);
   return [...map.values()];
 }
 

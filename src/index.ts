@@ -10,11 +10,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents.js";
 import { loadConfig } from "./config.js";
-import { isHerdrAvailable } from "./herdr.js";
-import { Orchestrator } from "./orchestrator.js";
+import { parseFleetCommand } from "./fleet-command.js";
+import { isHerdrAvailable, OUTSIDE_HERDR_WARNING } from "./herdr.js";
+import { Orchestrator, AgentWaitTimeoutError } from "./orchestrator.js";
 import { HerdrRuntime } from "./runtime-herdr.js";
 import { makeGroupId, RunRegistry } from "./registry.js";
-import type { AgentRun, ThinkingLevel } from "./types.js";
+import { THINKING_LEVELS, type AgentRun } from "./types.js";
 
 const STATE_ICON: Record<AgentRun["state"], string> = {
   starting: "…",
@@ -33,12 +34,36 @@ function modelLabel(model?: string): string {
   return slash >= 0 ? model.slice(slash + 1) : model;
 }
 
+function notifyWarnings(ctx: ExtensionContext, warnings: string[]): void {
+  if (!warnings.length) return;
+  ctx.ui.notify(warnings.join("\n"), "warning");
+}
+
+function registerOutsideHerdrWarning(pi: ExtensionAPI): void {
+  let notified = false;
+  pi.on("session_start", (_event, ctx) => {
+    if (notified) return;
+    notified = true;
+    ctx.ui.notify(OUTSIDE_HERDR_WARNING, "warning");
+  });
+  pi.registerCommand("fleet", {
+    description: "Show the current Herdr agent fleet",
+    async handler(_args, ctx) {
+      ctx.ui.notify(OUTSIDE_HERDR_WARNING, "warning");
+    },
+  });
+}
+
 export default function herdrFleetExtension(pi: ExtensionAPI): void {
-  if (!isHerdrAvailable()) return;
+  if (!isHerdrAvailable()) {
+    registerOutsideHerdrWarning(pi);
+    return;
+  }
 
   const cwd = process.cwd();
-  const config = loadConfig(cwd);
-  const agents = discoverAgents(cwd);
+  const startupWarnings: string[] = [];
+  const config = loadConfig(cwd, startupWarnings);
+  const agents = discoverAgents(cwd, startupWarnings);
   const group = process.env.PI_HERDR_FLEET_GROUP || makeGroupId();
   const depth =
     Number.parseInt(process.env.PI_HERDR_FLEET_DEPTH || "0", 10) || 0;
@@ -135,6 +160,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     activeCtx = ctx;
+    notifyWarnings(ctx, startupWarnings);
     sweepStalePromptFiles();
     registryWatcher?.close();
     registryWatcher = fs.watch(registryPath, onRegistryChanged);
@@ -190,7 +216,9 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
           }),
         ),
         thinking: Type.Optional(
-          Type.String({ description: "off|minimal|low|medium|high|xhigh|max" }),
+          Type.String({
+            description: THINKING_LEVELS.join("|"),
+          }),
         ),
         cwd: Type.Optional(
           Type.String({
@@ -216,7 +244,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
           }),
         ),
       }),
-      async execute(_id, params, _signal, _onUpdate, ctx) {
+      async execute(_id, params, signal, _onUpdate, ctx) {
         activeCtx = ctx;
         const direction =
           params.direction === "right" || params.direction === "down"
@@ -228,13 +256,14 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
             task: params.task,
             name: params.name,
             model: params.model,
-            thinking: params.thinking as ThinkingLevel | undefined,
+            thinking: params.thinking,
             cwd: params.cwd,
             worktree: params.worktree,
             direction,
             interactive: params.interactive,
           },
           ctx,
+          signal,
         );
         return {
           content: [
@@ -262,9 +291,13 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
         target: Type.String(),
         message: Type.String(),
       }),
-      async execute(_id, params, _signal, _onUpdate, ctx) {
+      async execute(_id, params, signal, _onUpdate, ctx) {
         activeCtx = ctx;
-        const run = await orchestrator.send(params.target, params.message);
+        const run = await orchestrator.send(
+          params.target,
+          params.message,
+          signal,
+        );
         return {
           content: [
             {
@@ -288,18 +321,36 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
       name: "agent_wait",
       label: "Wait Agent",
       description:
-        "Synchronize with a fleet agent using Herdr's server-owned semantic wait. Defaults to idle/done/blocked; prefer event-driven completion unless this call must block.",
+        `Synchronize with a fleet agent using Herdr's server-owned semantic wait. Defaults to idle/done/blocked. If timeout_ms is omitted, waits up to ${config.defaultWaitTimeoutMs}ms (configurable as defaultWaitTimeoutMs). Prefer event-driven completion unless this call must block.`,
       parameters: Type.Object({
         target: Type.String(),
         timeout_ms: Type.Optional(Type.Number({ minimum: 1 })),
       }),
-      async execute(_id, params, _signal, _onUpdate, ctx) {
+      async execute(_id, params, signal, _onUpdate, ctx) {
         activeCtx = ctx;
-        const run = await orchestrator.wait(params.target, params.timeout_ms);
-        return {
-          content: [{ type: "text", text: `${run.name} is ${run.state}.` }],
-          details: run,
-        };
+        try {
+          const run = await orchestrator.wait(
+            params.target,
+            params.timeout_ms,
+            signal,
+          );
+          return {
+            content: [{ type: "text", text: `${run.name} is ${run.state}.` }],
+            details: run,
+          };
+        } catch (error) {
+          if (error instanceof AgentWaitTimeoutError) {
+            return {
+              content: [{ type: "text", text: error.message }],
+              details: {
+                run: error.run,
+                timedOut: true,
+                timeoutMs: error.timeoutMs,
+              },
+            };
+          }
+          throw error;
+        }
       },
     }),
   );
@@ -392,9 +443,20 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
   );
 
   pi.registerCommand("fleet", {
-    description: "Show the current Herdr agent fleet",
-    async handler(_args, ctx) {
+    description:
+      "Show the current Herdr agent fleet. `/fleet close` closes non-interactive done panes.",
+    async handler(args, ctx) {
       activeCtx = ctx;
+      notifyWarnings(ctx, startupWarnings);
+      if (parseFleetCommand(args).action === "close-done") {
+        const closed = await orchestrator.closeDonePanes();
+        const text = closed.length
+          ? `Closed ${closed.length} done pane(s): ${closed.map((run) => `${run.name} [${run.id}]`).join(", ")}`
+          : "No done panes to close.";
+        ctx.ui.notify(text, "info");
+        updateWidget();
+        return;
+      }
       const runs = orchestrator.list();
       const lines = [
         `group=${group}`,

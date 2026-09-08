@@ -31,7 +31,10 @@ Herdr 内で Pi を起動し、現在の fleet を確認します。
 
 ```text
 /fleet
+/fleet close
 ```
+
+`/fleet` は一覧です。`/fleet close`（または `/fleet close done`）は、Herdr がまだ `done` と報告している非 interactive pane を閉じます。interactive / blocked / idle / 進行中の pane は残します。
 
 普段はそのまま Pi に依頼できます。
 
@@ -50,12 +53,13 @@ agent_focus({ target: "planner" })
 
 ## 設定
 
-プロジェクト設定は `.pi/herdr-fleet.json`、ユーザー設定は `~/.pi/agent/herdr-fleet.json` に置きます。
+[`config.example.json`](config.example.json) を `.pi/herdr-fleet.json`（プロジェクト）および／または `~/.pi/agent/herdr-fleet.json`（ユーザー）にコピーします。プロジェクトがユーザーを上書きし、どちらも組み込みデフォルトの上に載ります。`defaultModel` / `defaultThinking` を省略すると、今の Pi セッションの値が使われます。
 
 ```json
 {
   "maxConcurrent": 6,
   "maxDepth": 2,
+  "defaultWaitTimeoutMs": 120000,
   "roles": {
     "scout": {
       "model": "provider/fast-model",
@@ -69,7 +73,26 @@ agent_focus({ target: "planner" })
 }
 ```
 
-設定項目は [`config.example.json`](config.example.json) を参照してください。
+| キー | デフォルト | 意味 |
+| --- | --- | --- |
+| `runtime` | `"herdr"` | Herdr のみ対応。 |
+| `defaultModel` | 未設定（Pi セッション） | role に `model` が無いときのフォールバック。 |
+| `defaultThinking` | 未設定（Pi セッション） | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`。設定と agent frontmatter は不明な値を無視し、`agent_spawn` は拒否する。 |
+| `maxConcurrent` | `6` | `starting` または `working` の上限。idle / done / blocked は数えない。 |
+| `maxDepth` | `2` | ネスト上限。下記参照。 |
+| `notifyOnComplete` | `true` | 非 interactive のターン完了時に呼び出し元を起こす。 |
+| `recentReadLines` | `160` | `agent_read` と完了通知が読む行数（下限 20）。 |
+| `defaultWaitTimeoutMs` | `120000` | モデルが `timeout_ms` を省略したときの `agent_wait` 上限。 |
+| `closeOnSettle` | `true` | 非 interactive の `idle`/`done` をターン完了後に閉じる（sync 時も同じ年齢・再確認ゲート）。`false` なら `/fleet close` まで pane を残す。 |
+| `roles.<name>` | `{}` | role ごとの `model` / `thinking` / `worktree` / `interactive` / `spawning`。 |
+
+### ネスト（`spawning` × `maxDepth`）
+
+- この拡張を読み込んだ Pi セッションが depth `0`。spawn するたびに `parentDepth + 1`。
+- 今のセッションの depth が `>= maxDepth` なら spawn は拒否される。デフォルト `2` では root → child → grandchild までで、grandchild は spawn できない。
+- 子 agent が `agent_spawn` を持てるのは、その role が `spawning: true`（設定または agent markdown）**かつ** `parentDepth + 1 < maxDepth` のときだけ。
+- bundled の `scout` / `planner` / `worker` / `reviewer` は `spawning: false` なので、role を上書きしない限り spawn できるのは root セッションだけ。
+- `interactive: true`（bundled の `planner`）は人間操作用に pane を残す。完了しても呼び出し元を自動では起こさず、pane も自動 close しない。
 
 ## ロール
 
@@ -80,7 +103,7 @@ agent_focus({ target: "planner" })
 | `worker` | 実装と検証 |
 | `reviewer` | 独立したコードレビュー |
 
-カスタム role は `.pi/agents/` または `~/.pi/agent/agents/` に追加できます。
+カスタム role は `.pi/agents/` または `~/.pi/agent/agents/` に追加できます（プロジェクト優先）。frontmatter は `roles.<name>` と同じキー（`model` / `thinking` / `worktree` / `interactive` / `spawning`）を受け付けます。
 
 worktree isolation は opt-in で、role または spawn ごとに有効化できます。
 
@@ -88,9 +111,9 @@ worktree isolation は opt-in で、role または spawn ごとに有効化で�
 
 | Tool | 用途 |
 | --- | --- |
-| `agent_spawn` | Pi agent を Herdr pane で起動 |
-| `agent_send` | fleet member にメッセージを送信 |
-| `agent_wait` | agent を明示的に待機 |
+| `agent_spawn` | Pi agent を Herdr pane で起動。ツールキャンセル（`AbortSignal`）に応じ、中断時は新規 pane を閉じる。 |
+| `agent_send` | fleet member にメッセージを送信。`AbortSignal` に応じるが既存 pane は閉じない。 |
+| `agent_wait` | agent を明示的に待機。`AbortSignal` とデフォルト timeout に応じる。 |
 | `agent_read` | focus を変えず最近の出力を取得 |
 | `agent_interrupt` | 現在の turn を interrupt |
 | `agent_focus` | agent pane に focus して直接操作 |
@@ -121,7 +144,7 @@ Herdr 0.8.2 と Pi 0.85.0 でライブ E2E テスト済み。
 spawn、ライフサイクル完了通知、モデルルーティング、ピアメッセージング、
 エージェント制御、worktree 分離、同時実行制限とネスト。
 
-blocked・startup-blocked のフローは、決定論的な E2E テストではまだカバーされていません。
+blocked / startup-blocked は orchestrator の単体テスト（`agent_blocked` / `agent_not_ready`）でカバーしています。Herdr の approval UI を使うライブ E2E はまだ決定論スイートに入っていません。
 
 ## クレジット
 

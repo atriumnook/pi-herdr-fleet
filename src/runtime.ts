@@ -28,16 +28,28 @@ export interface AgentMetadata {
 
 export interface AgentRuntime {
   readonly kind: "herdr";
-  createLocation(options: CreateLocationOptions): Promise<RuntimeLocation>;
+  createLocation(
+    options: CreateLocationOptions,
+    signal?: AbortSignal,
+  ): Promise<RuntimeLocation>;
   start(
     name: string,
     paneId: string,
     agentArgs: string[],
+    signal?: AbortSignal,
   ): Promise<RuntimeAgentState>;
   closePane(paneId: string): Promise<void>;
   paneExists(paneId: string): Promise<boolean>;
-  prompt(name: string, text: string): Promise<RuntimeAgentState>;
-  wait(name: string, timeoutMs?: number): Promise<RuntimeAgentState>;
+  prompt(
+    name: string,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<RuntimeAgentState>;
+  wait(
+    name: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<RuntimeAgentState>;
   get(name: string): Promise<RuntimeAgentState>;
   read(name: string, lines: number): Promise<string>;
   interrupt(name: string): Promise<void>;
