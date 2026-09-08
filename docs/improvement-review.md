@@ -107,6 +107,7 @@
 - **Where:** `src/orchestrator.ts`（`done`/`idle` でも pane を閉じない）、README Status 節
 - **Why:** `maxConcurrent` は `starting|working` だけを数える。終わった agent と `blocked` は予算外のまま pane を占有する。README が言う通り blocked / startup-blocked は決定論的 E2E 対象外。
 - **Direction:** 自動 close は製品判断（interactive pane を残す設計）。opt-in の `closeOnSettle` か、`/fleet` に「done を close」を足す程度が安全。blocked はフィクスチャ（approval UI）が要るので、まず runtime フェイクで `agent_blocked` / `agent_not_ready` の分岐を単体テストする。
+- **Status:** この PR で、既存 orphan prune と同じ年齢（10s）と 300ms 再確認を使い、非 interactive の `idle`/`done` で pending なしの pane を `closePane` して `stopped` にする。interactive / blocked / working / 若い run / `get()` 失敗は残す。`agent_send` は対象を reap hold してから `syncEvents` する。close 前に `runtime.get()` で Herdr を再確認。`closeOnSettle` 設定と `/fleet` 一括 close は未着手。blocked E2E も未着手。
 
 ### 9. 設定面の DX
 
@@ -128,5 +129,6 @@
 3. ~~項目 5 の警告~~ **済み**（この PR）
 4. ~~項目 6 の wait timeout / abort~~ **済み**（この PR）
 5. ~~項目 7 の JSONL / PIPE_BUF~~ **済み**（この PR）
+6. ~~項目 8 の完了 pane 回収~~ **済み**（この PR）
 
-次は P2 の残り（完了 pane、設定 DX）。
+次は P2 の設定 DX（項目 9）。

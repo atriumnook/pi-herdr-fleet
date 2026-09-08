@@ -67,6 +67,10 @@ function isLive(run: AgentRun): boolean {
   return run.state !== "stopped" && run.state !== "failed";
 }
 
+/** Skip prune/reap while a pane may still be appearing or flipping TUI state. */
+const MIN_RUN_AGE_MS = 10_000;
+const PANE_RECHECK_MS = 300;
+
 function shortModel(model?: string): string {
   if (!model) return "inherit";
   const slash = model.lastIndexOf("/");
@@ -99,6 +103,8 @@ export class Orchestrator {
   private eventsStarted = false;
   private eventState: "connecting" | "connected" | "reconnecting" | "stopped" =
     "stopped";
+  /** Run ids that must survive reap (e.g. agent_send before pending is armed). */
+  private readonly reapHold = new Set<string>();
   private readonly events: HerdrEventSubscriber;
 
   constructor(
@@ -146,6 +152,7 @@ export class Orchestrator {
     // pane with pane_not_found, which would otherwise wedge the subscriber in
     // a reconnect loop and permanently leak concurrency slots.
     await this.pruneOrphanRuns();
+    await this.reapSettledPanes();
     await this.events.ensurePanes(
       this.list()
         .filter(isLive)
@@ -183,6 +190,7 @@ export class Orchestrator {
         this.syncQueued = false;
         if (!this.eventsStarted) break;
         await this.pruneOrphanRuns();
+        await this.reapSettledPanes();
         await this.events.ensurePanes(
           this.list()
             .filter(isLive)
@@ -206,14 +214,70 @@ export class Orchestrator {
    */
   private async pruneOrphanRuns(): Promise<void> {
     for (const run of this.list().filter(isLive)) {
-      if (Date.now() - run.startedAt < 10_000) continue;
+      if (Date.now() - run.startedAt < MIN_RUN_AGE_MS) continue;
       if (!(await this.paneGone(run.paneId))) continue;
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await new Promise((resolve) => setTimeout(resolve, PANE_RECHECK_MS));
       if (!(await this.paneGone(run.paneId))) continue;
       run.state = "stopped";
       run.updatedAt = Date.now();
       this.dropPending(run.id);
       this.save(run);
+    }
+  }
+
+  /**
+   * Non-interactive idle/done panes occupy Herdr layout after the turn has
+   * settled and no follow-up is pending. Close them the same way we prune
+   * orphans: never young runs, never interactive/blocked/in-flight, and
+   * re-query Herdr before destroying the pane.
+   */
+  private async reapSettledPanes(): Promise<void> {
+    for (const run of this.list()) {
+      if (!this.isReapCandidate(run)) continue;
+      const first = await this.settledStatus(run);
+      if (!first || !isCompleted(first)) continue;
+      await new Promise((resolve) => setTimeout(resolve, PANE_RECHECK_MS));
+      if (!this.isReapCandidate(run)) continue;
+      const second = await this.settledStatus(run);
+      if (!second || !isCompleted(second)) continue;
+      try {
+        await this.runtime.closePane(run.paneId);
+      } catch {
+        continue;
+      }
+      run.state = "stopped";
+      run.updatedAt = Date.now();
+      this.dropPending(run.id);
+      this.save(run);
+    }
+  }
+
+  private isReapCandidate(run: AgentRun): boolean {
+    if (run.interactive) return false;
+    if (!isCompleted(run.state)) return false;
+    if (this.pending.has(run.id)) return false;
+    if (this.reapHold.has(run.id)) return false;
+    const now = Date.now();
+    if (now - run.startedAt < MIN_RUN_AGE_MS) return false;
+    if (now - run.updatedAt < MIN_RUN_AGE_MS) return false;
+    return true;
+  }
+
+  private async settledStatus(run: AgentRun): Promise<AgentState | undefined> {
+    try {
+      const current = await this.runtime.get(run.herdrName);
+      if (current.status === run.state) return current.status;
+      if (isCompleted(current.status)) {
+        // idle↔done is still settled. Do not bump updatedAt or the age gate
+        // would postpone (and, if no later sync arrives, skip) the reap.
+        run.state = current.status;
+        return current.status;
+      }
+      this.updateState(run, current.status);
+      return current.status;
+    } catch {
+      // Unknown failures must not destroy a pane that may still be useful.
+      return undefined;
     }
   }
 
@@ -420,8 +484,15 @@ export class Orchestrator {
 
   async send(target: string, message: string): Promise<AgentRun> {
     const run = this.mustResolve(target);
-    await this.syncEvents();
-    return this.submit(run, message, true);
+    // syncEvents reaps settled panes. Hold this target first so a follow-up
+    // send cannot close the pane it is about to prompt.
+    this.reapHold.add(run.id);
+    try {
+      await this.syncEvents();
+      return await this.submit(run, message, true);
+    } finally {
+      this.reapHold.delete(run.id);
+    }
   }
 
   async wait(

@@ -39,6 +39,7 @@ class FakeRuntime implements AgentRuntime {
   getStatus: AgentState = "working";
   startImpl?: AgentRuntime["start"];
   waitImpl?: AgentRuntime["wait"];
+  getImpl?: AgentRuntime["get"];
   paneExistsImpl?: (paneId: string) => Promise<boolean>;
   private locations = 0;
 
@@ -93,7 +94,8 @@ class FakeRuntime implements AgentRuntime {
     return this.get(name);
   }
 
-  async get(_name: string): Promise<RuntimeAgentState> {
+  async get(name: string): Promise<RuntimeAgentState> {
+    if (this.getImpl) return this.getImpl(name);
     return { status: this.getStatus };
   }
 
@@ -363,6 +365,238 @@ describe("orchestrator lifecycle", () => {
     delete process.env.HERDR_SOCKET_PATH;
     await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
     expect(registry.byPane("w1:new")?.state).toBe("starting");
+  });
+
+  test("reaps a stale non-interactive settled pane after the age and recheck gates", async () => {
+    const { orch, runtime, registry } = makeHarness();
+    const ago = Date.now() - 20_000;
+    registry.upsert({
+      id: "settled01",
+      name: "Scout",
+      role: "scout",
+      herdrName: "fleet-scout-settled",
+      paneId: "w1:old",
+      cwd: "/tmp/repo",
+      state: "done",
+      depth: 1,
+      interactive: false,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    });
+    runtime.getStatus = "done";
+    delete process.env.HERDR_SOCKET_PATH;
+    await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+    expect(runtime.closed).toEqual(["w1:old"]);
+    expect(registry.byPane("w1:old")?.state).toBe("stopped");
+  });
+
+  test("does not reap a young settled pane", async () => {
+    const { orch, runtime, registry } = makeHarness();
+    registry.upsert({
+      id: "youngdone",
+      name: "Scout",
+      role: "scout",
+      herdrName: "fleet-scout-young",
+      paneId: "w1:young",
+      cwd: "/tmp/repo",
+      state: "done",
+      depth: 1,
+      interactive: false,
+      worktree: false,
+      startedAt: Date.now() - 1_000,
+      updatedAt: Date.now() - 1_000,
+    });
+    runtime.getStatus = "done";
+    delete process.env.HERDR_SOCKET_PATH;
+    await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+    expect(runtime.closed).toEqual([]);
+    expect(registry.byPane("w1:young")?.state).toBe("done");
+  });
+
+  test("does not reap interactive, blocked, or still-working panes", async () => {
+    const { orch, runtime, registry } = makeHarness();
+    const ago = Date.now() - 20_000;
+    const base = {
+      role: "scout",
+      cwd: "/tmp/repo",
+      depth: 1,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    } as const;
+    registry.upsert({
+      ...base,
+      id: "interactive1",
+      name: "Planner",
+      herdrName: "fleet-planner-1",
+      paneId: "w1:int",
+      state: "idle",
+      interactive: true,
+    });
+    registry.upsert({
+      ...base,
+      id: "blocked001",
+      name: "Scout",
+      herdrName: "fleet-scout-block",
+      paneId: "w1:blk",
+      state: "blocked",
+      interactive: false,
+    });
+    registry.upsert({
+      ...base,
+      id: "working001",
+      name: "Worker",
+      herdrName: "fleet-worker-1",
+      paneId: "w1:wrk",
+      state: "working",
+      interactive: false,
+    });
+    runtime.getStatus = "idle";
+    delete process.env.HERDR_SOCKET_PATH;
+    await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+    expect(runtime.closed).toEqual([]);
+    expect(registry.byPane("w1:int")?.state).toBe("idle");
+    expect(registry.byPane("w1:blk")?.state).toBe("blocked");
+    expect(registry.byPane("w1:wrk")?.state).toBe("working");
+  });
+
+  test("does not reap when Herdr reports the agent started working during the recheck", async () => {
+    const { orch, runtime, registry } = makeHarness();
+    const ago = Date.now() - 20_000;
+    registry.upsert({
+      id: "flip00001",
+      name: "Scout",
+      role: "scout",
+      herdrName: "fleet-scout-flip",
+      paneId: "w1:flip",
+      cwd: "/tmp/repo",
+      state: "done",
+      depth: 1,
+      interactive: false,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    });
+    let calls = 0;
+    runtime.getImpl = async () => {
+      calls += 1;
+      return { status: calls === 1 ? "done" : "working" };
+    };
+    delete process.env.HERDR_SOCKET_PATH;
+    await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+    expect(runtime.closed).toEqual([]);
+    expect(registry.byPane("w1:flip")?.state).toBe("working");
+  });
+
+  test("does not reap when runtime get() throws", async () => {
+    const { orch, runtime, registry } = makeHarness();
+    const ago = Date.now() - 20_000;
+    registry.upsert({
+      id: "getfail01",
+      name: "Scout",
+      role: "scout",
+      herdrName: "fleet-scout-getfail",
+      paneId: "w1:fail",
+      cwd: "/tmp/repo",
+      state: "done",
+      depth: 1,
+      interactive: false,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    });
+    runtime.getImpl = async () => {
+      throw new Error("herdr unavailable");
+    };
+    delete process.env.HERDR_SOCKET_PATH;
+    await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+    expect(runtime.closed).toEqual([]);
+    expect(registry.byPane("w1:fail")?.state).toBe("done");
+  });
+
+  test("reaps when Herdr reports done for a stale idle pane without bumping the age gate", async () => {
+    const { orch, runtime, registry } = makeHarness();
+    const ago = Date.now() - 20_000;
+    registry.upsert({
+      id: "idledone1",
+      name: "Scout",
+      role: "scout",
+      herdrName: "fleet-scout-idledone",
+      paneId: "w1:idledone",
+      cwd: "/tmp/repo",
+      state: "idle",
+      depth: 1,
+      interactive: false,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    });
+    runtime.getStatus = "done";
+    delete process.env.HERDR_SOCKET_PATH;
+    await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+    expect(runtime.closed).toEqual(["w1:idledone"]);
+    expect(registry.byPane("w1:idledone")?.state).toBe("stopped");
+  });
+
+  test("send holds a stale settled pane so follow-up prompt is not reaped first", async () => {
+    const { orch, runtime, registry } = makeHarness();
+    registry.upsert({
+      id: "anchor001",
+      name: "Scout",
+      role: "scout",
+      herdrName: "fleet-scout-anchor",
+      paneId: "w1:anchor",
+      cwd: "/tmp/repo",
+      state: "working",
+      depth: 1,
+      interactive: false,
+      worktree: false,
+      startedAt: Date.now() - 1_000,
+      updatedAt: Date.now() - 1_000,
+    });
+    delete process.env.HERDR_SOCKET_PATH;
+    await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+
+    const ago = Date.now() - 20_000;
+    registry.upsert({
+      id: "follow001",
+      name: "Scout",
+      role: "scout",
+      herdrName: "fleet-scout-follow",
+      paneId: "w1:follow",
+      cwd: "/tmp/repo",
+      state: "done",
+      depth: 1,
+      interactive: false,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    });
+    registry.upsert({
+      id: "otherdone",
+      name: "Scout",
+      role: "scout",
+      herdrName: "fleet-scout-other",
+      paneId: "w1:other",
+      cwd: "/tmp/repo",
+      state: "done",
+      depth: 1,
+      interactive: false,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    });
+    runtime.getStatus = "done";
+    runtime.promptStatus = "working";
+    const sent = await orch.send("follow001", "next task");
+    expect(runtime.closed).toEqual(["w1:other"]);
+    expect(runtime.prompts).toEqual([
+      { name: "fleet-scout-follow", text: "next task" },
+    ]);
+    expect(sent.state).toBe("working");
+    expect(registry.byPane("w1:follow")?.state).toBe("working");
+    expect(registry.byPane("w1:other")?.state).toBe("stopped");
   });
 
   test(
