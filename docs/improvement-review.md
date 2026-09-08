@@ -72,6 +72,7 @@
   2. registry: `lastOutput` 切り詰め、増分パース、壊れた 1 行を飛ばすこと
   3. `AgentRuntime` をフェイクして spawn gate / settle timer / prune の数本
   4. `bun run check` を GitHub Actions で main/PR に乗せる
+- **Status:** この PR で 1–4 を追加した（`test/agents.test.ts`、`test/registry.test.ts`、`test/orchestrator.test.ts`、`.github/workflows/ci.yml`）。subscriber のソケットモックは未着手。
 
 ### 5. 失敗が沈黙する
 
@@ -117,7 +118,7 @@
 
 ## 推奨する次の一手（短い順）
 
-1. 項目 4 の bundled-agent / registry 回帰テストと `bun run check` の CI（変更が小さく、`bd64afc` を固定できる）
+1. ~~項目 4 の bundled-agent / registry 回帰テストと `bun run check` の CI~~ **済み**（この PR）
 2. 項目 2 の trailing sync と項目 3 の subscriber ゲート（残っているイベント穴）
 3. 項目 5 の警告（サポートコストを減らす）
 4. 項目 6 の wait timeout / abort（固着ターンの防止）
