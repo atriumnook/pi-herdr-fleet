@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents.js";
 import { loadConfig } from "./config.js";
-import { isHerdrAvailable } from "./herdr.js";
+import { isHerdrAvailable, OUTSIDE_HERDR_WARNING } from "./herdr.js";
 import { Orchestrator } from "./orchestrator.js";
 import { HerdrRuntime } from "./runtime-herdr.js";
 import { makeGroupId, RunRegistry } from "./registry.js";
@@ -33,12 +33,36 @@ function modelLabel(model?: string): string {
   return slash >= 0 ? model.slice(slash + 1) : model;
 }
 
+function notifyWarnings(ctx: ExtensionContext, warnings: string[]): void {
+  if (!warnings.length) return;
+  ctx.ui.notify(warnings.join("\n"), "warning");
+}
+
+function registerOutsideHerdrWarning(pi: ExtensionAPI): void {
+  let notified = false;
+  pi.on("session_start", (_event, ctx) => {
+    if (notified) return;
+    notified = true;
+    ctx.ui.notify(OUTSIDE_HERDR_WARNING, "warning");
+  });
+  pi.registerCommand("fleet", {
+    description: "Show the current Herdr agent fleet",
+    async handler(_args, ctx) {
+      ctx.ui.notify(OUTSIDE_HERDR_WARNING, "warning");
+    },
+  });
+}
+
 export default function herdrFleetExtension(pi: ExtensionAPI): void {
-  if (!isHerdrAvailable()) return;
+  if (!isHerdrAvailable()) {
+    registerOutsideHerdrWarning(pi);
+    return;
+  }
 
   const cwd = process.cwd();
-  const config = loadConfig(cwd);
-  const agents = discoverAgents(cwd);
+  const startupWarnings: string[] = [];
+  const config = loadConfig(cwd, startupWarnings);
+  const agents = discoverAgents(cwd, startupWarnings);
   const group = process.env.PI_HERDR_FLEET_GROUP || makeGroupId();
   const depth =
     Number.parseInt(process.env.PI_HERDR_FLEET_DEPTH || "0", 10) || 0;
@@ -135,6 +159,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     activeCtx = ctx;
+    notifyWarnings(ctx, startupWarnings);
     sweepStalePromptFiles();
     registryWatcher?.close();
     registryWatcher = fs.watch(registryPath, onRegistryChanged);
@@ -407,6 +432,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
             `${STATE_ICON[r.state]} ${r.id} ${r.name} (${r.role}) ${r.state} ${r.herdrName} ${r.paneId}`,
         ),
       ];
+      notifyWarnings(ctx, startupWarnings);
       ctx.ui.notify(lines.join("\n"), "info");
       updateWidget();
     },

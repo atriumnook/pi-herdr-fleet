@@ -84,6 +84,7 @@
   - `src/agents.ts` `loadDir` の空 `catch` — 壊れた `*.md` は role ごと消える
 - **Why:** インストールしたのに `/fleet` が無い、設定したのに効かない、scout がいない、がすべて「何も起きない」。`bd64afc` の scout 欠落と同じクラス。
 - **Direction:** 挙動は変えない。`session_start` か `/fleet` で警告を出す。Herdr 外なら「Pi を Herdr 内で起動すること」を一度 notify。壊れた JSON/Markdown はファイル名を warning に含める。parse 失敗を握りつぶすのは残してよい（1 ファイルで拡張全体を殺さないため）。
+- **Status:** この PR で追加。Herdr 外は `session_start` で一度 + `/fleet` で再通知。壊れた `herdr-fleet.json` / agent `*.md` はファイル名付き warning。parse 失敗の握りつぶしは維持。`test/config.test.ts`、`test/extension.test.ts`、agents の skip 警告。
 
 ### 6. `agent_wait` が無制限にブロックし、全ツールが AbortSignal を無視する
 
@@ -122,5 +123,5 @@
 
 1. ~~項目 4 の bundled-agent / registry 回帰テストと `bun run check` の CI~~ **済み**（この PR）
 2. ~~項目 2 の trailing sync と項目 3 の subscriber ゲート~~ **済み**（この PR）
-3. 項目 5 の警告（サポートコストを減らす）
+3. ~~項目 5 の警告~~ **済み**（この PR）
 4. 項目 6 の wait timeout / abort（固着ターンの防止）

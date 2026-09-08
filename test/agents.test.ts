@@ -61,10 +61,13 @@ describe("bundled agent discovery", () => {
       ].join("\n"),
     );
 
-    const agents = discoverAgents(cwd);
+    const warnings: string[] = [];
+    const agents = discoverAgents(cwd, warnings);
     const scout = agents.find((a) => a.name === "scout");
     expect(scout?.source).toBe("bundled");
     expect(scout?.description).toContain("reconnaissance");
     expect(agents.some((a) => a.name === "helper")).toBe(true);
+    expect(warnings.some((warning) => warning.includes("scout.md"))).toBe(true);
+    expect(warnings.some((warning) => warning.includes("pi-herdr-fleet: skipping invalid agent file"))).toBe(true);
   });
 });

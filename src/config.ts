@@ -12,10 +12,30 @@ const DEFAULTS: FleetConfig = {
   roles: {},
 };
 
-function readJson(file: string): Record<string, unknown> {
+function readJson(file: string, warnings?: string[]): Record<string, unknown> {
+  let raw: string;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
-  } catch {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") return {};
+    warnings?.push(
+      `pi-herdr-fleet: ignoring unreadable JSON in ${file}: ${err.message}`,
+    );
+    return {};
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      warnings?.push(
+        `pi-herdr-fleet: ignoring invalid JSON in ${file}: expected a JSON object`,
+      );
+      return {};
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    warnings?.push(`pi-herdr-fleet: ignoring invalid JSON in ${file}: ${detail}`);
     return {};
   }
 }
@@ -67,8 +87,11 @@ function findNearestProjectConfig(cwd: string): string | null {
   }
 }
 
-export function loadConfig(cwd: string): FleetConfig {
+export function loadConfig(cwd: string, warnings?: string[]): FleetConfig {
   const globalPath = path.join(getAgentDir(), "herdr-fleet.json");
   const projectPath = findNearestProjectConfig(cwd);
-  return mergeConfig(mergeConfig(DEFAULTS, readJson(globalPath)), projectPath ? readJson(projectPath) : {});
+  return mergeConfig(
+    mergeConfig(DEFAULTS, readJson(globalPath, warnings)),
+    projectPath ? readJson(projectPath, warnings) : {},
+  );
 }

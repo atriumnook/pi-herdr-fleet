@@ -28,7 +28,11 @@ function parseThinking(v: unknown): ThinkingLevel | undefined {
     : undefined;
 }
 
-function loadDir(dir: string, source: AgentDefinition["source"]): AgentDefinition[] {
+function loadDir(
+  dir: string,
+  source: AgentDefinition["source"],
+  warnings?: string[],
+): AgentDefinition[] {
   if (!fs.existsSync(dir)) return [];
   const result: AgentDefinition[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -52,8 +56,12 @@ function loadDir(dir: string, source: AgentDefinition["source"]): AgentDefinitio
         source,
         filePath,
       });
-    } catch {
+    } catch (error) {
       // Invalid agent files are isolated; one bad definition must not break discovery.
+      const detail = error instanceof Error ? error.message : String(error);
+      warnings?.push(
+        `pi-herdr-fleet: skipping invalid agent file ${filePath}: ${detail}`,
+      );
     }
   }
   return result;
@@ -75,16 +83,16 @@ function findNearestProjectDir(cwd: string): string | null {
   }
 }
 
-export function discoverAgents(cwd: string): AgentDefinition[] {
+export function discoverAgents(cwd: string, warnings?: string[]): AgentDefinition[] {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const bundledDir = path.resolve(here, "..", "agents");
   const userDir = path.join(getAgentDir(), "agents");
   const projectDir = findNearestProjectDir(cwd);
 
   const map = new Map<string, AgentDefinition>();
-  for (const agent of loadDir(bundledDir, "bundled")) map.set(agent.name.toLowerCase(), agent);
-  for (const agent of loadDir(userDir, "user")) map.set(agent.name.toLowerCase(), agent);
-  if (projectDir) for (const agent of loadDir(projectDir, "project")) map.set(agent.name.toLowerCase(), agent);
+  for (const agent of loadDir(bundledDir, "bundled", warnings)) map.set(agent.name.toLowerCase(), agent);
+  for (const agent of loadDir(userDir, "user", warnings)) map.set(agent.name.toLowerCase(), agent);
+  if (projectDir) for (const agent of loadDir(projectDir, "project", warnings)) map.set(agent.name.toLowerCase(), agent);
   return [...map.values()];
 }
 

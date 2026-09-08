@@ -25,6 +25,9 @@ export function isHerdrAvailable(): boolean {
   return process.env.HERDR_ENV === "1" && Boolean(process.env.HERDR_PANE_ID);
 }
 
+export const OUTSIDE_HERDR_WARNING =
+  "pi-herdr-fleet: Pi is not running inside Herdr. Start Pi from a Herdr pane to use fleet tools and /fleet.";
+
 export function getHerdrSocketPath(): string | undefined {
   return process.env.HERDR_SOCKET_PATH || undefined;
 }
