@@ -51,6 +51,21 @@ agent_send({ target: "reviewer", message: "Please check src/auth/token.ts" })
 agent_focus({ target: "planner" })
 ```
 
+### Choosing model and thinking
+
+`thinking` (Pi's reasoning effort) accepts `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`. Sources are resolved in this order:
+
+1. `agent_spawn` arguments (`model` / `thinking`). Asking in prose, e.g. "spawn worker with thinking low", goes through this path.
+2. `roles.<name>.thinking` in the config (project `.pi/herdr-fleet.json` overlays user `~/.pi/agent/herdr-fleet.json`).
+3. The role definition (`thinking:` in the `agents/*.md` frontmatter).
+4. `defaultThinking` in the config; when omitted, the current Pi session's level.
+
+A `model` carrying a suffix such as `provider/model:low` keeps that suffix; `thinking` does not override it.
+
+```text
+agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low", task: "..." })
+```
+
 ## Configuration
 
 Copy [`config.example.json`](config.example.json) to `.pi/herdr-fleet.json` (project) and/or `~/.pi/agent/herdr-fleet.json` (user). Project overlays user; both overlay built-in defaults. Omit `defaultModel` / `defaultThinking` to inherit the current Pi session.

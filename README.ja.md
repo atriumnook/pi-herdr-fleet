@@ -51,6 +51,21 @@ agent_send({ target: "reviewer", message: "src/auth/token.ts を確認してく�
 agent_focus({ target: "planner" })
 ```
 
+### モデルと thinking の指定
+
+`thinking`（Pi の思考量。effort に相当）は `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` を受け付けます。指定は次の順に優先されます。
+
+1. `agent_spawn` の引数（`model` / `thinking`）。自然言語で「worker を thinking low で立てて」と頼んでもこの経路になる。
+2. 設定ファイルの `roles.<name>.thinking`（プロジェクト `.pi/herdr-fleet.json` がユーザー `~/.pi/agent/herdr-fleet.json` を上書き）。
+3. role 定義（`agents/*.md` の frontmatter `thinking:`）。
+4. 設定ファイルの `defaultThinking`。省略時は今の Pi セッションの値。
+
+`model` に `provider/model:low` のように suffix を付けた場合はその値が使われ、上記の `thinking` では上書きされません。
+
+```text
+agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low", task: "..." })
+```
+
 ## 設定
 
 [`config.example.json`](config.example.json) を `.pi/herdr-fleet.json`（プロジェクト）および／または `~/.pi/agent/herdr-fleet.json`（ユーザー）にコピーします。プロジェクトがユーザーを上書きし、どちらも組み込みデフォルトの上に載ります。`defaultModel` / `defaultThinking` を省略すると、今の Pi セッションの値が使われます。
