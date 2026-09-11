@@ -62,6 +62,17 @@ agent_focus({ target: "planner" })
 
 `model` に `provider/model:low` のように suffix を付けた場合はその値が使われ、上記の `thinking` では上書きされません。
 
+コストの高いモデルに高い thinking を使わせたくない場合は、設定の `models` でモデルごとに許可する値を固定します。親エージェントがどの経路で指定しても、許可外の値では起動しません。
+
+```json
+{
+  "models": {
+    "openai-codex/gpt-6-astra": { "thinking": ["low", "medium"] },
+    "opencode-go/glm-5.3-flash": { "thinking": ["max"] }
+  }
+}
+```
+
 ```text
 agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low", task: "..." })
 ```
@@ -100,6 +111,7 @@ agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low"
 | `defaultWaitTimeoutMs` | `120000` | モデルが `timeout_ms` を省略したときの `agent_wait` 上限。 |
 | `closeOnSettle` | `true` | 非 interactive の `idle`/`done` をターン完了後に閉じる（sync 時も同じ年齢・再確認ゲート）。`false` なら `/fleet close` まで pane を残す。 |
 | `roles.<name>` | `{}` | role ごとの `model` / `thinking` / `worktree` / `interactive` / `spawning`。 |
+| `models.<provider/model>` | `{}` | モデルごとの `thinking` 許可リスト（配列）。spawn 引数・role 設定・role 定義で明示された値が許可外なら spawn を拒否し、`defaultThinking` / Pi セッション由来の値は許可内の最上位に丸める。`model:level` の suffix も同じ判定を受ける。 |
 
 ### ネスト（`spawning` × `maxDepth`）
 

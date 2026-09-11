@@ -4,6 +4,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   isThinkingLevel,
   type FleetConfig,
+  type ModelPolicy,
   type RoleOverride,
 } from "./types.js";
 
@@ -16,6 +17,7 @@ const DEFAULTS: FleetConfig = {
   defaultWaitTimeoutMs: 120_000,
   closeOnSettle: true,
   roles: {},
+  models: {},
 };
 
 function readJson(file: string, warnings?: string[]): Record<string, unknown> {
@@ -58,7 +60,22 @@ function parseRole(value: unknown): RoleOverride {
   };
 }
 
+function parseModelPolicy(value: unknown): ModelPolicy {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const v = value as Record<string, unknown>;
+  const thinking = Array.isArray(v.thinking)
+    ? v.thinking.filter(isThinkingLevel)
+    : undefined;
+  return { thinking: thinking?.length ? thinking : undefined };
+}
+
 function mergeConfig(base: FleetConfig, raw: Record<string, unknown>): FleetConfig {
+  const models = { ...base.models };
+  if (raw.models && typeof raw.models === "object" && !Array.isArray(raw.models)) {
+    for (const [name, value] of Object.entries(raw.models as Record<string, unknown>)) {
+      models[name] = { ...(models[name] ?? {}), ...parseModelPolicy(value) };
+    }
+  }
   const roles = { ...base.roles };
   if (raw.roles && typeof raw.roles === "object" && !Array.isArray(raw.roles)) {
     for (const [name, value] of Object.entries(raw.roles as Record<string, unknown>)) {
@@ -76,6 +93,7 @@ function mergeConfig(base: FleetConfig, raw: Record<string, unknown>): FleetConf
     defaultWaitTimeoutMs: typeof raw.defaultWaitTimeoutMs === "number" ? Math.max(1, Math.floor(raw.defaultWaitTimeoutMs)) : base.defaultWaitTimeoutMs,
     closeOnSettle: typeof raw.closeOnSettle === "boolean" ? raw.closeOnSettle : base.closeOnSettle,
     roles,
+    models,
   };
 }
 

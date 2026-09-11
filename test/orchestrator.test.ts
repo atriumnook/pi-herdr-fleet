@@ -145,6 +145,7 @@ function config(overrides: Partial<FleetConfig> = {}): FleetConfig {
     recentReadLines: 80,
     defaultWaitTimeoutMs: 120_000,
     closeOnSettle: true,
+    models: {},
     roles: {},
     ...overrides,
   };
@@ -1025,5 +1026,61 @@ describe("pre-visual idle after prompt submission", () => {
     });
     expect(runtime.closed).toEqual([run.paneId]);
     expect(orch.list().find((item) => item.id === run.id)?.state).toBe("stopped");
+  });
+});
+
+describe("model thinking policy", () => {
+  const models: FleetConfig["models"] = {
+    "provider/frontier": { thinking: ["low", "medium"] },
+  };
+  const policy = () => makeHarness({ models });
+
+  test("rejects an explicit spawn thinking outside the model allow-list", async () => {
+    const { orch, runtime } = policy();
+    await expect(
+      orch.spawn(
+        { role: "scout", task: "go", model: "provider/frontier", thinking: "max" },
+        fakeCtx(),
+      ),
+    ).rejects.toThrow(/"max" is not allowed for provider\/frontier.*low, medium/);
+    expect(runtime.startCalls).toEqual([]);
+    expect(orch.list()).toEqual([]);
+  });
+
+  test("rejects a role-level thinking outside the allow-list", async () => {
+    const { orch } = makeHarness({
+      models,
+      roles: { scout: { model: "provider/frontier", thinking: "high" } },
+    });
+    await expect(orch.spawn({ role: "scout", task: "go" }, fakeCtx())).rejects.toThrow(
+      /not allowed for provider\/frontier/,
+    );
+  });
+
+  test("rejects a disallowed :level suffix on the model string", async () => {
+    const { orch } = policy();
+    await expect(
+      orch.spawn({ role: "scout", task: "go", model: "provider/frontier:max" }, fakeCtx()),
+    ).rejects.toThrow(/"max" is not allowed/);
+  });
+
+  test("clamps an inherited default thinking to the highest allowed level", async () => {
+    const { orch, runtime } = makeHarness({
+      models,
+      defaultThinking: "max",
+      roles: { scout: { model: "provider/frontier" } },
+    });
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    expect(run.thinking).toBe("medium");
+    expect(runtime.startCalls[0]?.agentArgs).toContain("provider/frontier:medium");
+  });
+
+  test("leaves models without a policy unrestricted", async () => {
+    const { orch } = policy();
+    const run = await orch.spawn(
+      { role: "scout", task: "go", model: "provider/cheap", thinking: "max" },
+      fakeCtx(),
+    );
+    expect(run.thinking).toBe("max");
   });
 });

@@ -8,6 +8,9 @@
   "recentReadLines": 160,
   "defaultWaitTimeoutMs": 120000,
   "closeOnSettle": true,
+  "models": {
+    "provider/frontier-model": { "thinking": ["low", "medium"] }
+  },
   "roles": {
     "scout": {
       "model": "provider/fast-model",

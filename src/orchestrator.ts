@@ -11,6 +11,7 @@ import { HerdrEventSubscriber, type HerdrSocketEvent } from "./herdr-events.js";
 import { makeHerdrName, makeId, type RunRegistry } from "./registry.js";
 import type { AgentRuntime } from "./runtime.js";
 import {
+  THINKING_LEVELS,
   requireThinkingLevel,
   type AgentDefinition,
   type AgentRun,
@@ -340,6 +341,33 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * `models.<model>.thinking` is the allow-list for that model. A level that
+   * was chosen explicitly (spawn argument, role override, role definition)
+   * outside the list is rejected so the caller re-decides; a level inherited
+   * from defaults is clamped to the highest allowed one. A `:level` suffix on
+   * the model string is the effective level and is checked the same way.
+   */
+  private applyModelPolicy(
+    model: string | undefined,
+    thinking: ThinkingLevel | undefined,
+    explicit: boolean,
+  ): ThinkingLevel | undefined {
+    if (!model) return thinking;
+    const match = /^(.*):(off|minimal|low|medium|high|xhigh|max)$/.exec(model);
+    const baseModel = match ? match[1]! : model;
+    const effective = match ? (match[2] as ThinkingLevel) : thinking;
+    const allowed = this.config.models[baseModel]?.thinking;
+    if (!allowed?.length) return effective;
+    if (effective !== undefined && allowed.includes(effective)) return effective;
+    if (explicit || match) {
+      throw new Error(
+        `Thinking level "${effective}" is not allowed for ${baseModel}. Allowed: ${allowed.join(", ")}.`,
+      );
+    }
+    return [...THINKING_LEVELS].reverse().find((level) => allowed.includes(level))!;
+  }
+
   async spawn(
     request: SpawnRequest,
     ctx: ExtensionContext,
@@ -368,13 +396,18 @@ export class Orchestrator {
       definition.model ??
       this.config.defaultModel ??
       modelFromContext(ctx);
-    const thinking = requireThinkingLevel(
+    const explicitThinking =
       request.thinking !== undefined
         ? request.thinking
-        : (override.thinking ??
-          definition.thinking ??
+        : (override.thinking ?? definition.thinking);
+    const thinking = this.applyModelPolicy(
+      model,
+      requireThinkingLevel(
+        explicitThinking ??
           this.config.defaultThinking ??
-          this.pi.getThinkingLevel()),
+          this.pi.getThinkingLevel(),
+      ),
+      explicitThinking !== undefined,
     );
     const worktree =
       request.worktree ?? override.worktree ?? definition.worktree ?? false;

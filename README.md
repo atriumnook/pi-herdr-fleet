@@ -62,6 +62,17 @@ agent_focus({ target: "planner" })
 
 A `model` carrying a suffix such as `provider/model:low` keeps that suffix; `thinking` does not override it.
 
+To keep an expensive model from running at a high thinking level, pin the allowed levels per model under `models`. Whatever path the parent agent uses to pick a level, a value outside the list does not start.
+
+```json
+{
+  "models": {
+    "openai-codex/gpt-6-astra": { "thinking": ["low", "medium"] },
+    "opencode-go/glm-5.3-flash": { "thinking": ["max"] }
+  }
+}
+```
+
 ```text
 agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low", task: "..." })
 ```
@@ -100,6 +111,7 @@ Copy [`config.example.json`](config.example.json) to `.pi/herdr-fleet.json` (pro
 | `defaultWaitTimeoutMs` | `120000` | `agent_wait` limit when the model omits `timeout_ms`. |
 | `closeOnSettle` | `true` | Close non-interactive `idle`/`done` panes after the turn settles (and via the same age/recheck gates on sync). Set `false` to keep panes until `/fleet close`. |
 | `roles.<name>` | `{}` | Per-role `model`, `thinking`, `worktree`, `interactive`, `spawning`. |
+| `models.<provider/model>` | `{}` | Per-model allow-list of `thinking` levels (array). A level set explicitly (spawn argument, role config, role definition) outside the list rejects the spawn; a level inherited from `defaultThinking` / the Pi session is clamped to the highest allowed one. A `model:level` suffix is checked the same way. |
 
 ### Nesting (`spawning` × `maxDepth`)
 

@@ -77,4 +77,25 @@ describe("fleet config loading", () => {
     const config = loadConfig(cwd);
     expect(config.defaultWaitTimeoutMs).toBe(5000);
   });
+
+  test("models.<name>.thinking keeps known levels and merges project over user", () => {
+    const { cwd, userDir } = isolatedDirs();
+    fs.writeFileSync(
+      path.join(userDir, "herdr-fleet.json"),
+      JSON.stringify({
+        models: {
+          "provider/frontier": { thinking: ["low", "turbo", "medium"] },
+          "provider/cheap": { thinking: ["max"] },
+        },
+      }),
+    );
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "herdr-fleet.json"),
+      JSON.stringify({ models: { "provider/frontier": { thinking: ["low"] } } }),
+    );
+    const config = loadConfig(cwd);
+    expect(config.models["provider/frontier"]?.thinking).toEqual(["low"]);
+    expect(config.models["provider/cheap"]?.thinking).toEqual(["max"]);
+  });
 });

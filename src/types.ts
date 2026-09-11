@@ -63,6 +63,11 @@ export interface RoleOverride {
   spawning?: boolean;
 }
 
+export interface ModelPolicy {
+  /** Thinking levels this model may run with. Empty/undefined means unrestricted. */
+  thinking?: ThinkingLevel[];
+}
+
 export interface FleetConfig {
   runtime: "herdr";
   defaultModel?: string;
@@ -74,6 +79,7 @@ export interface FleetConfig {
   defaultWaitTimeoutMs: number;
   closeOnSettle: boolean;
   roles: Record<string, RoleOverride>;
+  models: Record<string, ModelPolicy>;
 }
 
 export interface AgentRun {
