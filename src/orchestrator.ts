@@ -25,6 +25,10 @@ interface PendingTurn {
   armed: boolean;
   blockedNotified?: boolean;
   generation: number;
+  /** When the prompt command returned; undefined until armed. */
+  submittedAt?: number;
+  /** Herdr reported `working` at least once for this turn. */
+  sawWorking?: boolean;
 }
 
 function withThinking(model: string, thinking?: ThinkingLevel): string {
@@ -71,6 +75,13 @@ function isLive(run: AgentRun): boolean {
 /** Skip prune/reap while a pane may still be appearing or flipping TUI state. */
 const MIN_RUN_AGE_MS = 10_000;
 const PANE_RECHECK_MS = 300;
+/**
+ * Herdr reports the pre-visual state (usually `idle`) for a short while after
+ * a prompt is submitted: the text is still being pasted and the TUI has not
+ * flipped to working. A settled state observed inside this window, before the
+ * turn was ever seen working, is not a completion.
+ */
+const PRE_VISUAL_GRACE_MS = 2_500;
 
 function shortModel(model?: string): string {
   if (!model) return "inherit";
@@ -665,6 +676,8 @@ export class Orchestrator {
           : submitted.status,
       );
       pending.armed = true;
+      pending.submittedAt = Date.now();
+      pending.sawWorking = submitted.status === "working";
       this.clearSettleCheck(run.id);
       if (submitted.status !== "working") {
         // An extremely fast turn can settle while the prompt command is still
@@ -682,7 +695,7 @@ export class Orchestrator {
           if (this.pending.get(run.id)?.generation === generation) {
             void this.reconcileRun(run);
           }
-        }, 2_500);
+        }, PRE_VISUAL_GRACE_MS);
         this.settleChecks.set(run.id, timer);
       }
       return run;
@@ -776,10 +789,25 @@ export class Orchestrator {
         // Event payloads are wake signals. Query the current Herdr state before
         // acting so retained/replayed socket events cannot regress the fleet.
         const current = await this.runtime.get(run.herdrName);
+        const pending = this.pending.get(run.id);
+        if (pending && current.status === "working") pending.sawWorking = true;
+        if (
+          pending?.armed &&
+          !pending.sawWorking &&
+          isCompleted(current.status) &&
+          pending.submittedAt !== undefined &&
+          Date.now() - pending.submittedAt < PRE_VISUAL_GRACE_MS
+        ) {
+          // Status events fire while the prompt is still being pasted and
+          // `agent get` still answers with the pre-visual idle. Treating that
+          // as settlement would finalize (and, with closeOnSettle, close the
+          // pane of) a turn that has not started. The settle check scheduled
+          // at submission re-verifies once the grace period has elapsed.
+          return;
+        }
         // Skip the save when nothing changed: redundant registry appends feed
         // the fs.watch loop and amplify the very churn reconciliation handles.
         if (current.status !== run.state) this.updateState(run, current.status);
-        const pending = this.pending.get(run.id);
         if (pending?.armed && run.state === "blocked")
           await this.notifyBlocked(run, pending);
         else if (pending?.armed && isCompleted(run.state))

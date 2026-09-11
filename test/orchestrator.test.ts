@@ -975,3 +975,55 @@ describe("orchestrator lifecycle", () => {
     ).toBe(true);
   });
 });
+
+describe("pre-visual idle after prompt submission", () => {
+  test("a status event right after submit does not finalize or close the pane", async () => {
+    const { orch, runtime } = makeHarness();
+    runtime.promptStatus = "idle";
+    runtime.getStatus = "idle";
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    expect(run.state).toBe("working");
+    // Herdr emits agent_status_changed while the prompt text is still being
+    // pasted; `agent get` still reports the pre-visual idle state.
+    await (
+      orch as unknown as {
+        handleSocketEvent(event: {
+          event: string;
+          data: Record<string, unknown>;
+          receivedAt: number;
+        }): Promise<void>;
+      }
+    ).handleSocketEvent({
+      event: "pane.agent_status_changed",
+      data: { pane_id: run.paneId },
+      receivedAt: Date.now(),
+    });
+    expect(runtime.closed).toEqual([]);
+    expect(orch.list().find((item) => item.id === run.id)?.state).toBe("working");
+  });
+
+  test("a settled status after the grace period still finalizes and closes", async () => {
+    const { orch, runtime } = makeHarness();
+    runtime.promptStatus = "idle";
+    runtime.getStatus = "idle";
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    const internals = orch as unknown as {
+      pending: Map<string, { submittedAt?: number }>;
+      handleSocketEvent(event: {
+        event: string;
+        data: Record<string, unknown>;
+        receivedAt: number;
+      }): Promise<void>;
+    };
+    const pending = internals.pending.get(run.id);
+    expect(pending).toBeDefined();
+    pending!.submittedAt = Date.now() - 3_000;
+    await internals.handleSocketEvent({
+      event: "pane.agent_status_changed",
+      data: { pane_id: run.paneId },
+      receivedAt: Date.now(),
+    });
+    expect(runtime.closed).toEqual([run.paneId]);
+    expect(orch.list().find((item) => item.id === run.id)?.state).toBe("stopped");
+  });
+});
