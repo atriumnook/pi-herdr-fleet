@@ -14,7 +14,7 @@ import { parseFleetCommand } from "./fleet-command.js";
 import { isHerdrAvailable, OUTSIDE_HERDR_WARNING } from "./herdr.js";
 import { Orchestrator, AgentWaitTimeoutError } from "./orchestrator.js";
 import { HerdrRuntime } from "./runtime-herdr.js";
-import { makeGroupId, RunRegistry } from "./registry.js";
+import { makeGroupId, RunRegistry, sweepStaleRegistries } from "./registry.js";
 import { THINKING_LEVELS, type AgentRun } from "./types.js";
 import { buildWidgetView } from "./widget.js";
 
@@ -149,6 +149,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
     activeCtx = ctx;
     notifyWarnings(ctx, startupWarnings);
     sweepStalePromptFiles();
+    sweepStaleRegistries(registryPath);
     registryWatcher?.close();
     registryWatcher = fs.watch(registryPath, onRegistryChanged);
     updateWidget();

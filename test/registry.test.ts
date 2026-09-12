@@ -8,6 +8,8 @@ import {
   COMPACT_MIN_BYTES,
   COMPACT_MIN_RATIO,
   RunRegistry,
+  STALE_REGISTRY_MS,
+  sweepStaleRegistries,
 } from "../src/registry.js";
 import type { AgentRun } from "../src/types.js";
 
@@ -253,5 +255,32 @@ describe("registry compaction", () => {
     fs.writeFileSync(file, `${latest}\n`);
     expect(a.all()).toHaveLength(1);
     expect(a.all()[0]?.lastOutput).toBe("keep me");
+  });
+});
+
+describe("sweepStaleRegistries", () => {
+  test("removes old sibling registries and keeps the current and recent ones", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-registry-sweep-"));
+    const current = path.join(dir, "fleet-current.jsonl");
+    const old = path.join(dir, "fleet-old.jsonl");
+    const recent = path.join(dir, "fleet-recent.jsonl");
+    const other = path.join(dir, "notes.txt");
+    for (const file of [current, old, recent, other]) fs.writeFileSync(file, "");
+    const now = Date.now();
+    const stale = new Date(now - STALE_REGISTRY_MS - 60_000);
+    fs.utimesSync(old, stale, stale);
+    fs.utimesSync(current, stale, stale);
+    fs.utimesSync(other, stale, stale);
+
+    const removed = sweepStaleRegistries(current, now);
+
+    expect(removed).toEqual([old]);
+    expect(fs.existsSync(current)).toBe(true);
+    expect(fs.existsSync(recent)).toBe(true);
+    expect(fs.existsSync(other)).toBe(true);
+  });
+
+  test("a missing directory is not an error", () => {
+    expect(sweepStaleRegistries("/nonexistent/fleet/x.jsonl")).toEqual([]);
   });
 });

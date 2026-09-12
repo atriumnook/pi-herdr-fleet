@@ -40,6 +40,42 @@ export function makeId(): string {
   return crypto.randomBytes(4).toString("hex");
 }
 
+/** Registry files untouched for this long belong to sessions that are gone. */
+export const STALE_REGISTRY_MS = 7 * 24 * 3_600_000;
+
+/**
+ * Each root session appends to its own `<group>.jsonl`; nothing else removes
+ * them. Drop siblings of `current` that have not been written for
+ * STALE_REGISTRY_MS. A live session writes on every state change, so an
+ * mtime this old cannot belong to a fleet that is still doing anything.
+ */
+export function sweepStaleRegistries(
+  current: string,
+  now = Date.now(),
+): string[] {
+  const dir = path.dirname(current);
+  const removed: string[] = [];
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return removed;
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith(".jsonl")) continue;
+    const full = path.join(dir, entry);
+    if (path.resolve(full) === path.resolve(current)) continue;
+    try {
+      if (now - fs.statSync(full).mtimeMs < STALE_REGISTRY_MS) continue;
+      fs.rmSync(full, { force: true });
+      removed.push(full);
+    } catch {
+      // Already gone or unreadable; nothing to reclaim.
+    }
+  }
+  return removed;
+}
+
 export function makeGroupId(): string {
   return `fleet-${crypto.randomBytes(4).toString("hex")}`;
 }
