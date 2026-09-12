@@ -15,7 +15,7 @@ import { isHerdrAvailable, OUTSIDE_HERDR_WARNING } from "./herdr.js";
 import { Orchestrator, AgentWaitTimeoutError } from "./orchestrator.js";
 import { HerdrRuntime } from "./runtime-herdr.js";
 import { makeGroupId, RunRegistry, sweepStaleRegistries } from "./registry.js";
-import { THINKING_LEVELS, type AgentRun } from "./types.js";
+import { THINKING_LEVELS, type AgentRun, type FleetConfig } from "./types.js";
 import { buildWidgetView } from "./widget.js";
 
 const STATE_ICON: Record<AgentRun["state"], string> = {
@@ -32,6 +32,21 @@ const STATE_ICON: Record<AgentRun["state"], string> = {
 function notifyWarnings(ctx: ExtensionContext, warnings: string[]): void {
   if (!warnings.length) return;
   ctx.ui.notify(warnings.join("\n"), "warning");
+}
+
+/**
+ * Tell the model up front which thinking levels each model accepts, so it
+ * does not learn the allow-list from a rejected agent_spawn.
+ */
+function thinkingPolicyGuidance(config: FleetConfig): string[] {
+  const entries = Object.entries(config.models)
+    .filter(([, policy]) => policy.thinking?.length)
+    .map(([model, policy]) => `${model}: ${policy.thinking!.join("|")}`);
+  if (!entries.length) return [];
+  return [
+    "Thinking levels are restricted per model; a spawn outside the allow-list is rejected. Prefer omitting `thinking` and let the role/config decide.",
+    `Allowed thinking: ${entries.join("; ")}`,
+  ];
 }
 
 function registerOutsideHerdrWarning(pi: ExtensionAPI): void {
@@ -184,6 +199,7 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
       "Use agent_send for peer-to-peer coordination. Use agent_wait only when explicit synchronization is necessary; normal completion is event-driven.",
       "Herdr states are semantic: working is active, blocked needs human attention, done is unseen settled work, idle is seen/ready, and unknown is uncertainty rather than completion.",
       "Never auto-answer a blocked approval/question. Read the agent and surface the question to the human.",
+      ...thinkingPolicyGuidance(config),
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
   });
