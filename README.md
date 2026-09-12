@@ -111,7 +111,7 @@ Copy [`config.example.json`](config.example.json) to `.pi/herdr-fleet.json` (pro
 | `notifyOnComplete` | `true` | Wake the caller when a non-interactive turn settles. |
 | `recentReadLines` | `160` | Lines fetched by `agent_read` and completion notify (minimum 20). |
 | `defaultWaitTimeoutMs` | `120000` | `agent_wait` limit when the model omits `timeout_ms`. |
-| `closeOnSettle` | `true` | Close non-interactive `idle`/`done` panes after the turn settles (and via the same age/recheck gates on sync). Set `false` to keep panes until `/fleet close`. |
+| `closeOnSettle` | `true` | Close non-interactive `idle`/`done` panes after the turn settles (and via the same age/recheck gates on sync). Only the session that spawned a run closes it automatically; `/fleet close` is not limited that way. Set `false` to keep panes until `/fleet close`. |
 | `roles.<name>` | `{}` | Per-role `model`, `thinking`, `worktree`, `interactive`, `spawning`. |
 | `models.<provider/model>` | `{}` | Per-model allow-list of `thinking` levels (array). A level set explicitly (spawn argument, role config, role definition) outside the list rejects the spawn; a level inherited from `defaultThinking` / the Pi session is clamped to the highest allowed one. A `model:level` suffix is checked the same way. |
 

@@ -111,7 +111,7 @@ agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low"
 | `notifyOnComplete` | `true` | 非 interactive のターン完了時に呼び出し元を起こす。 |
 | `recentReadLines` | `160` | `agent_read` と完了通知が読む行数（下限 20）。 |
 | `defaultWaitTimeoutMs` | `120000` | モデルが `timeout_ms` を省略したときの `agent_wait` 上限。 |
-| `closeOnSettle` | `true` | 非 interactive の `idle`/`done` をターン完了後に閉じる（sync 時も同じ年齢・再確認ゲート）。`false` なら `/fleet close` まで pane を残す。 |
+| `closeOnSettle` | `true` | 非 interactive の `idle`/`done` をターン完了後に閉じる（sync 時も同じ年齢・再確認ゲート）。自動 close は自分が spawn した run に限る（`/fleet close` は無制限）。`false` なら `/fleet close` まで pane を残す。 |
 | `roles.<name>` | `{}` | role ごとの `model` / `thinking` / `worktree` / `interactive` / `spawning`。 |
 | `models.<provider/model>` | `{}` | モデルごとの `thinking` 許可リスト（配列）。spawn 引数・role 設定・role 定義で明示された値が許可外なら spawn を拒否し、`defaultThinking` / Pi セッション由来の値は許可内の最上位に丸める。`model:level` の suffix も同じ判定を受ける。 |
 

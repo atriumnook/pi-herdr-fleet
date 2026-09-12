@@ -283,6 +283,7 @@ export class Orchestrator {
 
   private async closeOnSettleIfNeeded(run: AgentRun): Promise<void> {
     if (!this.config.closeOnSettle) return;
+    if (!this.owns(run)) return;
     if (run.interactive) return;
     if (!isCompleted(run.state)) return;
     if (this.pending.has(run.id) || this.reapHold.has(run.id)) return;
@@ -304,7 +305,20 @@ export class Orchestrator {
     return true;
   }
 
+  /**
+   * Every fleet process (root and each child) watches the shared registry and
+   * runs the same reap, but `pending` / `reapHold` live only in the process
+   * that spawned the run. Automatic pane closing is therefore limited to the
+   * runs this process spawned; a child must never close its parent's agents
+   * while the parent is about to send them a follow-up. Explicit `/fleet
+   * close` is not gated: the user asked for it.
+   */
+  private owns(run: AgentRun): boolean {
+    return run.depth === this.depth + 1;
+  }
+
   private isReapCandidate(run: AgentRun): boolean {
+    if (!this.owns(run)) return false;
     if (run.interactive) return false;
     if (!isCompleted(run.state)) return false;
     if (this.pending.has(run.id)) return false;

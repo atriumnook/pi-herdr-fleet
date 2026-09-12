@@ -1084,3 +1084,43 @@ describe("model thinking policy", () => {
     expect(run.thinking).toBe("max");
   });
 });
+
+describe("automatic reap is limited to runs this process spawned", () => {
+  function staleSettled(depth: number, paneId: string): AgentRun {
+    const ago = Date.now() - 20_000;
+    return {
+      id: `d${depth}${paneId.replace(/\W/g, "")}`,
+      name: "Scout",
+      role: "scout",
+      herdrName: `fleet-scout-${paneId}`,
+      paneId,
+      cwd: "/tmp/repo",
+      state: "done",
+      depth,
+      interactive: false,
+      worktree: false,
+      startedAt: ago,
+      updatedAt: ago,
+    };
+  }
+
+  test("a root session does not reap a grandchild's pane, and a child does not reap its parent's", async () => {
+    const { orch, runtime, registry } = makeHarness();
+    registry.upsert(staleSettled(1, "w1:own"));
+    registry.upsert(staleSettled(2, "w1:grandchild"));
+    runtime.getStatus = "done";
+    delete process.env.HERDR_SOCKET_PATH;
+    await expect(orch.startEvents()).rejects.toThrow(/HERDR_SOCKET_PATH/);
+    expect(runtime.closed).toEqual(["w1:own"]);
+    expect(registry.byPane("w1:grandchild")?.state).toBe("done");
+  });
+
+  test("/fleet close stays explicit and closes done panes at any depth", async () => {
+    const { orch, runtime, registry } = makeHarness();
+    registry.upsert(staleSettled(1, "w1:own"));
+    registry.upsert(staleSettled(2, "w1:grandchild"));
+    runtime.getStatus = "done";
+    const closed = await orch.closeDonePanes();
+    expect(closed.map((run) => run.paneId).sort()).toEqual(["w1:grandchild", "w1:own"]);
+  });
+});
