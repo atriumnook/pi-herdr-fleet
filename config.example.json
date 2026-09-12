@@ -29,6 +29,7 @@
     "worker": {
       "model": "provider/strong-model",
       "thinking": "high",
+      "fallbackModels": ["provider/backup-model"],
       "worktree": false,
       "interactive": false,
       "spawning": false

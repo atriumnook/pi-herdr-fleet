@@ -14,6 +14,7 @@ import {
   THINKING_LEVELS,
   requireThinkingLevel,
   type AgentDefinition,
+  type RoleOverride,
   type AgentRun,
   type AgentState,
   type FleetConfig,
@@ -65,6 +66,25 @@ function ensureFleetTools(
   return [...set];
 }
 
+/** pi exited during `herdr agent start` with an error the runtime captured. */
+function isModelStartupFailure(error: unknown): boolean {
+  return (
+    error instanceof HerdrCommandError && error.codeName === "agent_start_failed"
+  );
+}
+
+/**
+ * pi renders an exhausted request as a line `Error: <reason>` and ends the
+ * turn. A turn that actually produced work ends with the HANDOFF section the
+ * fleet prompt asks for, so an `Error:` line without any HANDOFF is read as
+ * the turn having failed. Quoted errors inside a real handoff are not.
+ */
+export function detectTurnError(output: string | undefined): string | undefined {
+  if (!output || /HANDOFF/.test(output)) return undefined;
+  const match = [...output.matchAll(/^\s*Error: (.+?)\s*$/gm)].pop();
+  return match?.[1];
+}
+
 function isCompleted(state: AgentState): boolean {
   return state === "idle" || state === "done";
 }
@@ -111,6 +131,11 @@ export class Orchestrator {
     ReturnType<typeof setTimeout>
   >();
   private spawnGate: Promise<void> = Promise.resolve();
+  /** Fallback models still untried for a run, consulted if its first turn fails. */
+  private readonly spawnPlans = new Map<
+    string,
+    { request: SpawnRequest; fallbacks: string[] }
+  >();
   private syncInFlight?: Promise<void>;
   private syncQueued = false;
   private eventsStarted = false;
@@ -387,6 +412,23 @@ export class Orchestrator {
     ctx: ExtensionContext,
     signal?: AbortSignal,
   ): Promise<AgentRun> {
+    return this.spawnWithFallbacks(request, ctx, signal);
+  }
+
+  /**
+   * Try the primary model, then each configured fallback in order. Only a
+   * model-caused startup failure (pi exited with an error before becoming
+   * ready) advances to the next candidate; every other error is the caller's.
+   * `fallbacks` overrides the configured list when a replacement run is
+   * spawned after a first-turn failure, so already-tried models are skipped.
+   */
+  private async spawnWithFallbacks(
+    request: SpawnRequest,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+    fallbacks?: string[],
+    fallbackFrom?: string,
+  ): Promise<AgentRun> {
     if (this.depth >= this.config.maxDepth) {
       throw new Error(
         `Agent nesting limit reached: depth=${this.depth}, maxDepth=${this.config.maxDepth}`,
@@ -404,7 +446,7 @@ export class Orchestrator {
       this.config.roles[definition.name] ??
       this.config.roles[request.role] ??
       {};
-    const model =
+    const primary =
       request.model ??
       override.model ??
       definition.model ??
@@ -414,15 +456,74 @@ export class Orchestrator {
       request.thinking !== undefined
         ? request.thinking
         : (override.thinking ?? definition.thinking);
-    const thinking = this.applyModelPolicy(
-      model,
-      requireThinkingLevel(
-        explicitThinking ??
-          this.config.defaultThinking ??
-          this.pi.getThinkingLevel(),
-      ),
-      explicitThinking !== undefined,
+    const baseThinking = requireThinkingLevel(
+      explicitThinking ??
+        this.config.defaultThinking ??
+        this.pi.getThinkingLevel(),
     );
+    const candidates: Array<string | undefined> = [
+      primary,
+      ...(fallbacks ??
+        override.fallbackModels ??
+        definition.fallbackModels ??
+        []
+      ).filter((m) => m !== primary),
+    ];
+    const failures: string[] = [];
+    for (let i = 0; i < candidates.length; i++) {
+      const model = candidates[i];
+      // A fallback model is bounded by its own allow-list rather than
+      // rejected: the human listed it, and the list caps the effort.
+      const thinking = this.applyModelPolicy(
+        model,
+        baseThinking,
+        i === 0 && explicitThinking !== undefined,
+      );
+      try {
+        return await this.spawnAttempt(
+          request,
+          definition,
+          override,
+          model,
+          thinking,
+          candidates.slice(i + 1).filter((m): m is string => !!m),
+          i === 0 ? fallbackFrom : (candidates[i - 1] ?? fallbackFrom),
+          signal,
+        );
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        const reason = error instanceof Error ? error.message : String(error);
+        if (!isModelStartupFailure(error) || i === candidates.length - 1) {
+          if (!failures.length) throw error;
+          throw new Error(
+            `${reason}. Fallbacks exhausted: ${failures.join("; ")}`,
+          );
+        }
+        failures.push(`${model ?? "inherit"}: ${reason}`);
+        const next = candidates[i + 1];
+        await this.pi.sendMessage(
+          {
+            customType: "fleet-agent-fallback",
+            content: `Agent ${request.name?.trim() || definition.name} (${definition.name}) could not start on ${model ?? "the inherited model"}: ${reason}. Falling back to ${next} as configured.`,
+            display: true,
+          },
+          { deliverAs: "nextTurn" },
+        );
+      }
+    }
+    throw new Error("No model candidates to spawn.");
+  }
+
+  private async spawnAttempt(
+    request: SpawnRequest,
+    definition: AgentDefinition,
+    override: RoleOverride,
+    model: string | undefined,
+    thinking: ThinkingLevel | undefined,
+    fallbacks: string[],
+    fallbackFrom: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<AgentRun> {
     const worktree =
       request.worktree ?? override.worktree ?? definition.worktree ?? false;
     const interactive =
@@ -514,6 +615,7 @@ export class Orchestrator {
         cwd: location.cwd,
         model,
         thinking,
+        fallbackFrom,
         state: "starting",
         depth: this.depth + 1,
         interactive,
@@ -598,6 +700,7 @@ export class Orchestrator {
       // prompt submission", and the concurrency budget counts working runs from
       // the shared registry — a fire-and-forget submit would let the next spawn
       // observe the previous agent as still `starting` and exceed the limit.
+      if (fallbacks.length) this.spawnPlans.set(run.id, { request, fallbacks });
       await this.submit(run, request.task, !run.interactive, signal);
       return run;
     } catch (error) {
@@ -810,6 +913,9 @@ export class Orchestrator {
     if (!run) return;
 
     if (event.event === "pane.exited" || event.event === "pane.closed") {
+      // A run that already failed keeps that verdict; closing its pane is the
+      // cleanup, not a new outcome.
+      if (run.state === "failed") return;
       run.state = "stopped";
       run.updatedAt = Date.now();
       this.dropPending(run.id);
@@ -913,8 +1019,24 @@ export class Orchestrator {
     run.lastOutput = await this.runtime
       .read(run.herdrName, this.config.recentReadLines)
       .catch(() => undefined);
+    // Herdr reports an API failure (auth, rate limit, provider outage) as an
+    // ordinary settled turn; pi's own retries have already been spent. Turn
+    // it into a failure so the caller is not told the work is done.
+    const turnError = detectTurnError(run.lastOutput);
+    if (turnError && isCompleted(run.state)) {
+      run.state = "failed";
+      run.lastError = turnError;
+    }
     run.updatedAt = Date.now();
     this.save(run);
+    const plan = this.spawnPlans.get(run.id);
+    this.spawnPlans.delete(run.id);
+    if (run.state === "failed") {
+      if (pending.notify && this.config.notifyOnComplete)
+        await this.notifyFailure(run);
+      if (plan && pending.generation === 1) await this.respawn(run, plan);
+      return;
+    }
     if (pending.notify && this.config.notifyOnComplete) {
       const preview = (run.lastOutput ?? "(no readable output)").slice(-12_000);
       const blockedNote =
@@ -955,6 +1077,48 @@ export class Orchestrator {
       },
       { deliverAs: "followUp" },
     );
+  }
+
+  /**
+   * The delegated first turn failed on a model that has configured fallbacks
+   * left: start the same task again on the next one and tell the caller which
+   * run now carries it. Later turns are not retried; by then the agent has
+   * state the replacement would not have.
+   */
+  private async respawn(
+    run: AgentRun,
+    plan: { request: SpawnRequest; fallbacks: string[] },
+  ): Promise<void> {
+    const [next, ...rest] = plan.fallbacks;
+    if (!next) return;
+    try {
+      const replacement = await this.spawnWithFallbacks(
+        { ...plan.request, model: next, thinking: undefined },
+        { model: undefined } as ExtensionContext,
+        undefined,
+        rest,
+        run.model,
+      );
+      await this.pi.sendMessage(
+        {
+          customType: "fleet-agent-fallback",
+          content: `Agent ${run.name} (${run.role}) failed its first turn on ${run.model ?? "the inherited model"}; the same task was re-spawned as ${replacement.name} [${replacement.id}] on ${replacement.model} as configured. Wait for that run instead.`,
+          display: true,
+          details: { run: replacement },
+        },
+        { deliverAs: "followUp" },
+      );
+    } catch (error) {
+      await this.pi.sendMessage(
+        {
+          customType: "fleet-agent-fallback",
+          content: `Agent ${run.name} (${run.role}) failed on ${run.model ?? "the inherited model"} and the configured fallback could not start: ${error instanceof Error ? error.message : String(error)}`,
+          display: true,
+          details: { run },
+        },
+        { deliverAs: "followUp" },
+      );
+    }
   }
 
   private async notifyFailure(run: AgentRun): Promise<void> {

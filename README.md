@@ -79,6 +79,20 @@ To keep an expensive model from running at a high thinking level, pin the allowe
 agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low", task: "..." })
 ```
 
+### Model fallbacks
+
+A model can be unavailable: removed from the provider, rejected credentials, rate limits, an outage. List the alternatives per role and the fleet uses them in that order. Nothing falls back unless you configured it, and every switch is reported.
+
+```json
+{
+  "roles": {
+    "worker": { "model": "openai-codex/gpt-6-astra", "fallbackModels": ["opencode-go/deepseek-v4-pro"] }
+  }
+}
+```
+
+Two failure shapes are handled. If Pi exits with an error before it is ready (for example `Model "..." not found`), the spawn detects it within a second instead of waiting for Herdr's startup timeout, closes the pane, and starts the next model; the `agent_spawn` result carries `fallbackFrom` and the reason. If Pi starts but the delegated first turn ends with an API `Error:` line and no HANDOFF, the run is reported as `failed` with that reason and the same task is re-spawned on the next model as a new run. Later turns are only reported, never re-spawned. A fallback model runs at the highest level its own `models.<model>.thinking` allow-list permits.
+
 ## Configuration
 
 Copy [`config.example.json`](config.example.json) to `.pi/herdr-fleet.json` (project) and/or `~/.pi/agent/herdr-fleet.json` (user). Project overlays user; both overlay built-in defaults. Omit `defaultModel` / `defaultThinking` to inherit the current Pi session.
@@ -112,7 +126,7 @@ Copy [`config.example.json`](config.example.json) to `.pi/herdr-fleet.json` (pro
 | `recentReadLines` | `160` | Lines fetched by `agent_read` and completion notify (minimum 20). |
 | `defaultWaitTimeoutMs` | `120000` | `agent_wait` limit when the model omits `timeout_ms`. |
 | `closeOnSettle` | `true` | Close non-interactive `idle`/`done` panes after the turn settles (and via the same age/recheck gates on sync). Only the session that spawned a run closes it automatically; `/fleet close` is not limited that way. Set `false` to keep panes until `/fleet close`. |
-| `roles.<name>` | `{}` | Per-role `model`, `thinking`, `worktree`, `interactive`, `spawning`. |
+| `roles.<name>` | `{}` | Per-role `model`, `thinking`, `fallbackModels`, `worktree`, `interactive`, `spawning`. |
 | `models.<provider/model>` | `{}` | Per-model allow-list of `thinking` levels (array). A level set explicitly (spawn argument, role config, role definition) outside the list rejects the spawn; a level inherited from `defaultThinking` / the Pi session is clamped to the highest allowed one. A `model:level` suffix is checked the same way. |
 
 ### Nesting (`spawning` × `maxDepth`)
@@ -132,7 +146,7 @@ Copy [`config.example.json`](config.example.json) to `.pi/herdr-fleet.json` (pro
 | `worker` | Implementation and verification |
 | `reviewer` | Independent code review |
 
-Custom roles can be added under `.pi/agents/` or `~/.pi/agent/agents/` (project wins). Frontmatter accepts the same keys as `roles.<name>`: `model`, `thinking`, `worktree`, `interactive`, `spawning`.
+Custom roles can be added under `.pi/agents/` or `~/.pi/agent/agents/` (project wins). Frontmatter accepts the same keys as `roles.<name>`: `model`, `thinking`, `fallbackModels`, `worktree`, `interactive`, `spawning`.
 
 Worktree isolation is opt-in and can be enabled per role or spawn.
 

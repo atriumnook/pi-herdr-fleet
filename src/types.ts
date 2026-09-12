@@ -46,6 +46,7 @@ export interface AgentDefinition {
   description: string;
   model?: string;
   thinking?: ThinkingLevel;
+  fallbackModels?: string[];
   tools?: string[];
   systemPrompt: string;
   worktree?: boolean;
@@ -58,6 +59,8 @@ export interface AgentDefinition {
 export interface RoleOverride {
   model?: string;
   thinking?: ThinkingLevel;
+  /** Models to try, in order, when the primary model cannot start or fails its first turn. */
+  fallbackModels?: string[];
   worktree?: boolean;
   interactive?: boolean;
   spawning?: boolean;
@@ -100,6 +103,8 @@ export interface AgentRun {
   updatedAt: number;
   lastOutput?: string;
   lastError?: string;
+  /** Model this run replaced after a configured fallback, for the record. */
+  fallbackFrom?: string;
 }
 
 export interface SpawnRequest {

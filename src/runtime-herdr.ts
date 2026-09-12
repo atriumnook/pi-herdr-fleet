@@ -5,6 +5,7 @@ import {
   HerdrCommandError,
   herdrJson,
   herdrText,
+  type HerdrResult,
   isAbortError,
 } from "./herdr.js";
 import type {
@@ -15,6 +16,10 @@ import type {
   RuntimeLocation,
 } from "./runtime.js";
 import type { AgentState } from "./types.js";
+
+interface PaneGetResult {
+  pane?: { agent?: string | null };
+}
 
 interface PaneSplitResult {
   pane?: { pane_id?: string };
@@ -248,7 +253,7 @@ export class HerdrRuntime implements AgentRuntime {
     for (let attempt = 0; attempt < 5; attempt++) {
       if (signal?.aborted) throw abortError(signal);
       try {
-        const result = await herdrJson<AgentResult>(args, signal);
+        const result = await this.startWatchingForExit(paneId, args, signal);
         return statusFromResult(result.result);
       } catch (error) {
         lastError = error;
@@ -264,6 +269,64 @@ export class HerdrRuntime implements AgentRuntime {
       }
     }
     throw lastError;
+  }
+
+  /**
+   * `herdr agent start` only reports readiness or its own timeout; a pi that
+   * prints an error and exits at startup (unknown model, broken provider
+   * config) leaves Herdr waiting for the full timeout. Watch the pane while
+   * the start command runs: once no agent process is attached and the
+   * terminal shows a pi `Error:` line, fail fast with that message.
+   */
+  private async startWatchingForExit(
+    paneId: string,
+    args: string[],
+    signal?: AbortSignal,
+  ): Promise<HerdrResult<AgentResult>> {
+    const control = new AbortController();
+    const onOuterAbort = () => control.abort();
+    signal?.addEventListener("abort", onOuterAbort, { once: true });
+    const started = herdrJson<AgentResult>(args, control.signal).then(
+      (result) => ({ kind: "started" as const, result }),
+    );
+    const exited = this.watchStartupFailure(paneId, control.signal).then(
+      (message) => ({ kind: "exited" as const, message }),
+    );
+    // Whichever loses the race is aborted below; swallow its rejection so it
+    // cannot surface as an unhandled promise.
+    started.catch(() => undefined);
+    exited.catch(() => undefined);
+    try {
+      const outcome = await Promise.race([started, exited]);
+      if (outcome.kind === "exited") {
+        throw new HerdrCommandError(outcome.message, "agent_start_failed");
+      }
+      return outcome.result;
+    } finally {
+      control.abort();
+      signal?.removeEventListener("abort", onOuterAbort);
+    }
+  }
+
+  private async watchStartupFailure(
+    paneId: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    while (!signal.aborted) {
+      await abortableDelay(500, signal);
+      const pane = await herdrJson<PaneGetResult>(
+        ["pane", "get", paneId],
+        signal,
+      ).catch(() => undefined);
+      if (!pane || pane.result?.pane?.agent) continue;
+      const text = await herdrText(
+        ["pane", "read", paneId, "--source", "recent", "--lines", "40"],
+        signal,
+      ).catch(() => "");
+      const match = [...text.matchAll(/^\s*Error: (.+)$/gm)].pop();
+      if (match) return match[1]!.trim();
+    }
+    throw abortError(signal);
   }
 
   async closePane(paneId: string): Promise<void> {

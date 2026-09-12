@@ -79,6 +79,20 @@ agent_focus({ target: "planner" })
 agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low", task: "..." })
 ```
 
+### モデルのフォールバック
+
+モデルは使えなくなることがあります（プロバイダから削除、認証拒否、レート制限、障害）。役割ごとに代替モデルを順に列挙しておくと、その順で試します。設定していなければ何も切り替わらず、切り替えたときは必ず通知します。
+
+```json
+{
+  "roles": {
+    "worker": { "model": "openai-codex/gpt-6-astra", "fallbackModels": ["opencode-go/deepseek-v4-pro"] }
+  }
+}
+```
+
+扱う失敗は2種類です。Pi が ready になる前にエラーで終了した場合（`Model "..." not found` など）は、Herdr の起動 timeout を待たず1秒以内に検知して pane を閉じ、次のモデルで起動します。`agent_spawn` の結果には `fallbackFrom` と理由が入ります。Pi は起動したが委譲した最初のターンが API の `Error:` 行で終わり HANDOFF が無い場合は、その理由付きで `failed` として通知し、同じタスクを次のモデルで新しい run として再 spawn します。2ターン目以降の失敗は通知のみで再 spawn しません。フォールバック先のモデルは、そのモデルの `models.<model>.thinking` 許可リストの最上位レベルで動きます。
+
 ## 設定
 
 [`config.example.json`](config.example.json) を `.pi/herdr-fleet.json`（プロジェクト）および／または `~/.pi/agent/herdr-fleet.json`（ユーザー）にコピーします。プロジェクトがユーザーを上書きし、どちらも組み込みデフォルトの上に載ります。`defaultModel` / `defaultThinking` を省略すると、今の Pi セッションの値が使われます。
@@ -112,7 +126,7 @@ agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low"
 | `recentReadLines` | `160` | `agent_read` と完了通知が読む行数（下限 20）。 |
 | `defaultWaitTimeoutMs` | `120000` | モデルが `timeout_ms` を省略したときの `agent_wait` 上限。 |
 | `closeOnSettle` | `true` | 非 interactive の `idle`/`done` をターン完了後に閉じる（sync 時も同じ年齢・再確認ゲート）。自動 close は自分が spawn した run に限る（`/fleet close` は無制限）。`false` なら `/fleet close` まで pane を残す。 |
-| `roles.<name>` | `{}` | role ごとの `model` / `thinking` / `worktree` / `interactive` / `spawning`。 |
+| `roles.<name>` | `{}` | role ごとの `model` / `thinking` / `fallbackModels` / `worktree` / `interactive` / `spawning`。 |
 | `models.<provider/model>` | `{}` | モデルごとの `thinking` 許可リスト（配列）。spawn 引数・role 設定・role 定義で明示された値が許可外なら spawn を拒否し、`defaultThinking` / Pi セッション由来の値は許可内の最上位に丸める。`model:level` の suffix も同じ判定を受ける。 |
 
 ### ネスト（`spawning` × `maxDepth`）
@@ -132,7 +146,7 @@ agent_spawn({ role: "worker", model: "openai-codex/gpt-6-astra", thinking: "low"
 | `worker` | 実装と検証 |
 | `reviewer` | 独立したコードレビュー |
 
-カスタム role は `.pi/agents/` または `~/.pi/agent/agents/` に追加できます（プロジェクト優先）。frontmatter は `roles.<name>` と同じキー（`model` / `thinking` / `worktree` / `interactive` / `spawning`）を受け付けます。
+カスタム role は `.pi/agents/` または `~/.pi/agent/agents/` に追加できます（プロジェクト優先）。frontmatter は `roles.<name>` と同じキー（`model` / `thinking` / `fallbackModels` / `worktree` / `interactive` / `spawning`）を受け付けます。
 
 worktree isolation は opt-in で、role または spawn ごとに有効化できます。
 

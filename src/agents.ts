@@ -9,6 +9,7 @@ type Frontmatter = {
   description?: unknown;
   model?: unknown;
   thinking?: unknown;
+  fallbackModels?: unknown;
   tools?: unknown;
   worktree?: unknown;
   interactive?: unknown;
@@ -41,6 +42,7 @@ function loadDir(
         description,
         model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
         thinking: parseThinkingLevel(frontmatter.thinking),
+        fallbackModels: parseList(frontmatter.fallbackModels),
         tools: parseList(frontmatter.tools),
         worktree: typeof frontmatter.worktree === "boolean" ? frontmatter.worktree : undefined,
         interactive: typeof frontmatter.interactive === "boolean" ? frontmatter.interactive : undefined,

@@ -251,6 +251,35 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "an unknown model fails fast and falls back to the configured model",
+    async run() {
+      const h = makeHarness({
+        roles: { echo: { model: "bogus-provider/no-such-model", fallbackModels: [MODEL] } },
+      });
+      try {
+        await h.orchestrator.startEvents();
+        const startedAt = Date.now();
+        const run = await h.orchestrator.spawn(
+          { role: "echo", task: "Reply with exactly: E2E-FALLBACK" },
+          ctx,
+        );
+        const elapsed = Date.now() - startedAt;
+        assert(run.model === MODEL, `expected fallback model ${MODEL}, got ${run.model}`);
+        assert(run.fallbackFrom === "bogus-provider/no-such-model", "fallbackFrom not recorded");
+        assert(elapsed < 20_000, `fallback took ${elapsed}ms; startup failure was not detected early`);
+        const note = h.messages.find((m) => m.customType === "fleet-agent-fallback");
+        assert(note && /not found/i.test(note.content ?? ""), `fallback notice missing or without reason: ${note?.content}`);
+        const failed = h.orchestrator.list().find((r) => r.model === "bogus-provider/no-such-model");
+        assert(failed?.state === "failed", "primary attempt not recorded as failed");
+        assert(!(await h.runtime.paneExists(failed.paneId)), "failed primary pane was left open");
+        const result = await waitFor("completion message", completion(h, run));
+        assert((result.details?.run?.lastOutput ?? "").includes("E2E-FALLBACK"), "fallback agent did not answer");
+      } finally {
+        await h.stop();
+      }
+    },
+  },
+  {
     name: "two agents spawned back-to-back both settle",
     async run() {
       const h = makeHarness();

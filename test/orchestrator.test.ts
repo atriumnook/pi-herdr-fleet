@@ -12,7 +12,7 @@ import {
   HerdrCommandError,
 } from "../src/herdr.js";
 import { HerdrEventSubscriber } from "../src/herdr-events.js";
-import { Orchestrator, AgentWaitTimeoutError } from "../src/orchestrator.js";
+import { Orchestrator, AgentWaitTimeoutError, detectTurnError } from "../src/orchestrator.js";
 import { RunRegistry } from "../src/registry.js";
 import type {
   AgentMetadata,
@@ -45,6 +45,7 @@ class FakeRuntime implements AgentRuntime {
   waitImpl?: AgentRuntime["wait"];
   promptImpl?: AgentRuntime["prompt"];
   getImpl?: AgentRuntime["get"];
+  readImpl?: AgentRuntime["read"];
   paneExistsImpl?: (paneId: string) => Promise<boolean>;
   private locations = 0;
 
@@ -112,7 +113,8 @@ class FakeRuntime implements AgentRuntime {
     return { status: this.getStatus };
   }
 
-  async read(_name: string, _lines: number): Promise<string> {
+  async read(name: string, lines: number): Promise<string> {
+    if (this.readImpl) return this.readImpl(name, lines);
     return "agent output";
   }
 
@@ -1122,5 +1124,136 @@ describe("automatic reap is limited to runs this process spawned", () => {
     runtime.getStatus = "done";
     const closed = await orch.closeDonePanes();
     expect(closed.map((run) => run.paneId).sort()).toEqual(["w1:grandchild", "w1:own"]);
+  });
+});
+
+describe("model fallbacks", () => {
+  const startFailure = (model: string) =>
+    new HerdrCommandError(`Model "${model}" not found.`, "agent_start_failed");
+
+  function modelOf(args: string[]): string | undefined {
+    const i = args.indexOf("--model");
+    return i >= 0 ? args[i + 1]?.replace(/:[a-z]+$/, "") : undefined;
+  }
+
+  test("a startup failure on the primary model falls back to the configured next model", async () => {
+    const { orch, runtime, messages } = makeHarness({
+      roles: { scout: { model: "p/primary", fallbackModels: ["p/second", "p/third"] } },
+    });
+    runtime.startImpl = async (_name, _pane, args) => {
+      const model = modelOf(args) ?? "";
+      if (model.startsWith("p/primary")) throw startFailure("p/primary");
+      return { status: "idle" };
+    };
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    expect(run.model).toBe("p/second");
+    expect(run.fallbackFrom).toBe("p/primary");
+    expect(runtime.startCalls.map((c) => modelOf(c.agentArgs))).toEqual(["p/primary", "p/second"]);
+    expect(runtime.closed).toEqual(["w1:p1"]);
+    expect(runtime.prompts).toEqual([{ name: run.herdrName, text: "go" }]);
+    const fallback = messages.find((m) => (m as { customType?: string }).customType === "fleet-agent-fallback") as { content: string } | undefined;
+    expect(fallback?.content).toContain("could not start on p/primary");
+    expect(fallback?.content).toContain("Falling back to p/second");
+  });
+
+  test("errors that are not model startup failures do not trigger a fallback", async () => {
+    const { orch, runtime } = makeHarness({
+      roles: { scout: { model: "p/primary", fallbackModels: ["p/second"] } },
+    });
+    runtime.startImpl = async () => {
+      throw new HerdrCommandError("timed out waiting for agent startup", "timeout");
+    };
+    await expect(orch.spawn({ role: "scout", task: "go" }, fakeCtx())).rejects.toThrow(/timed out/);
+    expect(runtime.startCalls).toHaveLength(1);
+  });
+
+  test("exhausting every candidate reports all failures", async () => {
+    const { orch, runtime } = makeHarness({
+      roles: { scout: { model: "p/primary", fallbackModels: ["p/second"] } },
+    });
+    runtime.startImpl = async (_name, _pane, args) => {
+      throw startFailure(modelOf(args) ?? "?");
+    };
+    await expect(orch.spawn({ role: "scout", task: "go" }, fakeCtx())).rejects.toThrow(
+      /p\/second.*not found.*Fallbacks exhausted: p\/primary/,
+    );
+    expect(runtime.startCalls).toHaveLength(2);
+    expect(orch.list().every((run) => run.state === "failed")).toBe(true);
+  });
+
+  test("a fallback model is clamped to its own thinking allow-list instead of rejected", async () => {
+    const { orch, runtime } = makeHarness({
+      roles: { scout: { model: "p/primary", fallbackModels: ["p/frontier"] } },
+      models: { "p/frontier": { thinking: ["low"] } },
+    });
+    runtime.startImpl = async (_name, _pane, args) => {
+      if ((modelOf(args) ?? "").startsWith("p/primary")) throw startFailure("p/primary");
+      return { status: "idle" };
+    };
+    const run = await orch.spawn({ role: "scout", task: "go", thinking: "max" }, fakeCtx());
+    expect(run.model).toBe("p/frontier");
+    expect(run.thinking).toBe("low");
+  });
+
+  test("an API error on the first turn marks the run failed and re-spawns on the next model", async () => {
+    const { orch, runtime, messages } = makeHarness({
+      roles: { scout: { model: "p/primary", fallbackModels: ["p/second"] } },
+    });
+    runtime.promptStatus = "working";
+    let reads = 0;
+    runtime.readImpl = async () =>
+      reads++ === 0
+        ? "Retrying (3/3) in 8s...\nError: Connection error.\n"
+        : "E2E ok\n\nHANDOFF\noutcome: done";
+    const first = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    runtime.getStatus = "idle";
+    await orch.wait(first.id);
+    const firstNow = orch.list().find((r) => r.id === first.id);
+    expect(firstNow?.state).toBe("failed");
+    expect(firstNow?.lastError).toBe("Connection error.");
+    expect(runtime.closed).toEqual([]);
+    const replacement = orch.list().find((r) => r.id !== first.id);
+    expect(replacement?.model).toBe("p/second");
+    expect(replacement?.fallbackFrom).toBe("p/primary");
+    expect(runtime.prompts.map((p) => p.text)).toEqual(["go", "go"]);
+    const notes = messages.map((m) => m as { customType?: string; content?: string });
+    expect(notes.some((m) => m.customType === "fleet-agent-result" && /failed: Connection error/.test(m.content ?? ""))).toBe(true);
+    expect(notes.some((m) => m.customType === "fleet-agent-fallback" && /re-spawned as/.test(m.content ?? ""))).toBe(true);
+  });
+
+  test("an Error: line inside a real handoff is not a failure", async () => {
+    const { orch, runtime } = makeHarness({
+      roles: { scout: { model: "p/primary", fallbackModels: ["p/second"] } },
+    });
+    runtime.readImpl = async () => "Error: tests/test_x.py::test_y failed\n\nHANDOFF\noutcome: fixed";
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    runtime.getStatus = "idle";
+    const waited = await orch.wait(run.id);
+    expect(waited.state).toBe("stopped");
+    expect(orch.list()).toHaveLength(1);
+  });
+
+  test("a failure on a later turn is reported but not re-spawned", async () => {
+    const { orch, runtime } = makeHarness({
+      roles: { scout: { model: "p/primary", fallbackModels: ["p/second"] } },
+      closeOnSettle: false,
+    });
+    let reads = 0;
+    runtime.readImpl = async () => (reads++ === 0 ? "fine\nHANDOFF\nok" : "Error: Connection error.");
+    const run = await orch.spawn({ role: "scout", task: "go" }, fakeCtx());
+    runtime.getStatus = "idle";
+    await orch.wait(run.id);
+    await orch.send(run.id, "more");
+    await orch.wait(run.id);
+    expect(orch.list().find((r) => r.id === run.id)?.state).toBe("failed");
+    expect(orch.list()).toHaveLength(1);
+  });
+
+  test("detectTurnError reads the last Error: line only without a HANDOFF", () => {
+    expect(detectTurnError(undefined)).toBeUndefined();
+    expect(detectTurnError("all good")).toBeUndefined();
+    expect(detectTurnError("Error: 401 Unauthorized  ")).toBe("401 Unauthorized");
+    expect(detectTurnError("Error: first\nError: second")).toBe("second");
+    expect(detectTurnError("Error: x\nHANDOFF\n")).toBeUndefined();
   });
 });

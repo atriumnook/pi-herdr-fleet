@@ -54,6 +54,9 @@ function parseRole(value: unknown): RoleOverride {
   return {
     model: typeof v.model === "string" ? v.model : undefined,
     thinking: isThinkingLevel(v.thinking) ? v.thinking : undefined,
+    fallbackModels: Array.isArray(v.fallbackModels)
+      ? v.fallbackModels.filter((m): m is string => typeof m === "string" && m.length > 0)
+      : undefined,
     worktree: typeof v.worktree === "boolean" ? v.worktree : undefined,
     interactive: typeof v.interactive === "boolean" ? v.interactive : undefined,
     spawning: typeof v.spawning === "boolean" ? v.spawning : undefined,

@@ -98,4 +98,13 @@ describe("fleet config loading", () => {
     expect(config.models["provider/frontier"]?.thinking).toEqual(["low"]);
     expect(config.models["provider/cheap"]?.thinking).toEqual(["max"]);
   });
+
+  test("roles.<name>.fallbackModels keeps only non-empty strings", () => {
+    const { cwd, userDir } = isolatedDirs();
+    fs.writeFileSync(
+      path.join(userDir, "herdr-fleet.json"),
+      JSON.stringify({ roles: { worker: { fallbackModels: ["p/a", "", 3, "p/b"] } } }),
+    );
+    expect(loadConfig(cwd).roles.worker?.fallbackModels).toEqual(["p/a", "p/b"]);
+  });
 });

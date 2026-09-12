@@ -70,4 +70,17 @@ describe("bundled agent discovery", () => {
     expect(warnings.some((warning) => warning.includes("scout.md"))).toBe(true);
     expect(warnings.some((warning) => warning.includes("pi-herdr-fleet: skipping invalid agent file"))).toBe(true);
   });
+
+  test("frontmatter fallbackModels accepts a comma-separated list", () => {
+    const cwd = isolatedCwd();
+    const projectAgents = path.join(cwd, ".pi", "agents");
+    fs.mkdirSync(projectAgents, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectAgents, "backup.md"),
+      ["---", "name: backup", "description: Role with fallbacks", "model: p/primary", "fallbackModels: p/second, p/third", "---", "Body.", ""].join("\n"),
+    );
+    const backup = discoverAgents(cwd).find((a) => a.name === "backup");
+    expect(backup?.model).toBe("p/primary");
+    expect(backup?.fallbackModels).toEqual(["p/second", "p/third"]);
+  });
 });
