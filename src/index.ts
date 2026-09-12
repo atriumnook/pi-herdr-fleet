@@ -16,6 +16,7 @@ import { Orchestrator, AgentWaitTimeoutError } from "./orchestrator.js";
 import { HerdrRuntime } from "./runtime-herdr.js";
 import { makeGroupId, RunRegistry } from "./registry.js";
 import { THINKING_LEVELS, type AgentRun } from "./types.js";
+import { buildWidgetView } from "./widget.js";
 
 const STATE_ICON: Record<AgentRun["state"], string> = {
   starting: "…",
@@ -27,12 +28,6 @@ const STATE_ICON: Record<AgentRun["state"], string> = {
   failed: "×",
   stopped: "■",
 };
-
-function modelLabel(model?: string): string {
-  if (!model) return "inherit";
-  const slash = model.lastIndexOf("/");
-  return slash >= 0 ? model.slice(slash + 1) : model;
-}
 
 function notifyWarnings(ctx: ExtensionContext, warnings: string[]): void {
   if (!warnings.length) return;
@@ -94,45 +89,37 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
     }
   };
 
+  // The editor-area widget is transient: attention runs (starting/working/
+  // blocked/unknown) stay while they last, settled runs fade after a short
+  // window, and the widget disappears when nothing is left. The footer status
+  // carries the compact count. `/fleet` remains the on-demand full listing.
+  let widgetExpiryTimer: ReturnType<typeof setTimeout> | undefined;
   const updateWidget = (): void => {
     const ctx = activeCtx;
     if (!ctx?.hasUI) return;
+    if (widgetExpiryTimer) {
+      clearTimeout(widgetExpiryTimer);
+      widgetExpiryTimer = undefined;
+    }
     try {
-      const runs = registry.all();
-      if (!runs.length) {
-        ctx.ui.setWidget("herdr-fleet", undefined);
-        return;
-      }
-      const active = runs.filter(
-        (r) => r.state === "starting" || r.state === "working",
-      ).length;
-      const blocked = runs.filter((r) => r.state === "blocked").length;
-      const suffix = blocked ? ` · ${blocked} blocked` : "";
-      const socket = orchestrator.socketStatus();
-      const socketSuffix = socket === "connected" ? "" : ` · events:${socket}`;
-      const lines = [
-        `Fleet agents · ${active} active${suffix}${socketSuffix} · depth ${depth}/${config.maxDepth}`,
-      ];
-      // Active runs always stay visible; settled runs are shown only from the
-      // most recent few so a long session cannot push live agents out of the
-      // widget or grow the list without bound.
-      const live = runs.filter(
-        (r) =>
-          r.state === "starting" ||
-          r.state === "working" ||
-          r.state === "blocked",
+      const view = buildWidgetView(
+        {
+          runs: registry.all(),
+          now: Date.now(),
+          depth,
+          maxDepth: config.maxDepth,
+          socket: orchestrator.socketStatus(),
+        },
+        ctx.ui.theme,
       );
-      const settled = runs.filter((r) => !live.includes(r)).slice(-4);
-      for (const run of [...live, ...settled].slice(0, 8)) {
-        const thinking = run.thinking ? `:${run.thinking}` : "";
-        const wt = run.worktree ? " · wt" : "";
-        lines.push(
-          `${STATE_ICON[run.state]} ${run.name} (${run.role}) · ${modelLabel(run.model)}${thinking} · ${run.state}${wt}`,
+      ctx.ui.setWidget("herdr-fleet", view.lines.length ? view.lines : undefined);
+      ctx.ui.setStatus("herdr-fleet", view.status);
+      if (view.nextExpiryAt !== undefined) {
+        widgetExpiryTimer = setTimeout(
+          updateWidget,
+          Math.max(0, view.nextExpiryAt - Date.now()) + 50,
         );
       }
-      const overflow = runs.length - live.length - settled.length;
-      if (overflow > 0) lines.push(`… ${overflow} more`);
-      ctx.ui.setWidget("herdr-fleet", lines);
     } catch {
       // Widget updates are cosmetic. A UI failure must never propagate into
       // socket or registry callbacks, where it would crash the agent process.
@@ -176,6 +163,10 @@ export default function herdrFleetExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
+    if (widgetExpiryTimer) {
+      clearTimeout(widgetExpiryTimer);
+      widgetExpiryTimer = undefined;
+    }
     registryWatcher?.close();
     registryWatcher = undefined;
     orchestrator.stopEvents();

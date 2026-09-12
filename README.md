@@ -36,6 +36,8 @@ Start Pi inside Herdr and check the current fleet:
 
 `/fleet` lists the fleet. `/fleet close` (or `/fleet close done`) closes non-interactive panes that Herdr still reports as `done`. Interactive, blocked, idle, and in-flight panes stay open.
 
+While agents are in flight, a small widget above the editor lists them (working, starting, blocked, unknown) and the footer shows a compact count. Settled runs stay in the widget for two minutes, collapsed to the newest run per name, then the widget clears itself. `/fleet` is the full listing at any time.
+
 Then delegate work normally:
 
 ```text

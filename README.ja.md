@@ -36,6 +36,8 @@ Herdr 内で Pi を起動し、現在の fleet を確認します。
 
 `/fleet` は一覧です。`/fleet close`（または `/fleet close done`）は、Herdr がまだ `done` と報告している非 interactive pane を閉じます。interactive / blocked / idle / 進行中の pane は残します。
 
+進行中の agent（working / starting / blocked / unknown）がある間は editor の上に一覧 widget が出て、footer に件数が表示されます。終了した run は同名の最新1件に集約して2分間だけ残り、その後 widget は自動的に消えます。全件はいつでも `/fleet` で確認できます。
+
 普段はそのまま Pi に依頼できます。
 
 ```text
