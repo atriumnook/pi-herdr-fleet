@@ -21,7 +21,8 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test",
-    "check": "bun run typecheck && bun test"
+    "check": "bun run typecheck && bun test",
+    "e2e": "bun run e2e/herdr-live.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

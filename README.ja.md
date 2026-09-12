@@ -167,13 +167,18 @@ pi install "$(pwd)"
 
 ## ステータス
 
-Herdr 0.8.2 と Pi 0.85.0 でライブ E2E テスト済み。
+単体テストはフェイク runtime に対する orchestrator の挙動を固定します。ライブ E2E（`e2e/herdr-live.ts`）は、実際の Orchestrator・Herdr CLI・socket 購読を起動中の Herdr に対して動かし、安価なモデルで本物の Pi agent を spawn します。
 
-カバー範囲:
-spawn、ライフサイクル完了通知、モデルルーティング、ピアメッセージング、
-エージェント制御、worktree 分離、同時実行制限とネスト。
+```bash
+# Herdr 内の pane から（HERDR_ENV / HERDR_PANE_ID / HERDR_SOCKET_PATH は設定済み）
+bun run e2e
+# 手動で環境変数を渡す場合
+HERDR_ENV=1 HERDR_PANE_ID=wM:p1 HERDR_SOCKET_PATH=$HOME/.config/herdr/herdr.sock bun run e2e
+```
 
-blocked / startup-blocked は orchestrator の単体テスト（`agent_blocked` / `agent_not_ready`）でカバーしています。Herdr の approval UI を使うライブ E2E はまだ決定論スイートに入っていません。
+モデルは `PI_HERDR_FLEET_E2E_MODEL` / `PI_HERDR_FLEET_E2E_THINKING` で指定します（デフォルト `opencode-go/glm-5.3-flash:low`）。ライブで確認する範囲: 長い複数行タスクでの spawn（pre-visual idle の退行）、イベント駆動の完了と `closeOnSettle`、完了済み agent への `agent_send`、連続 spawn。最終確認は Herdr 0.8.2 / Pi 0.85.1。
+
+blocked / startup-blocked は orchestrator の単体テスト（`agent_blocked` / `agent_not_ready`）でカバーしています。Herdr の approval UI を使うライブ E2E はまだ入っていません。
 
 ## クレジット
 

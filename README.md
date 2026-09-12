@@ -167,11 +167,16 @@ pi install "$(pwd)"
 
 ## Status
 
-Live E2E tested with Herdr 0.8.2 and Pi 0.85.0.
+Unit tests cover the orchestrator against a fake runtime. A live E2E (`e2e/herdr-live.ts`) drives the real Orchestrator, Herdr CLI and socket subscription against a running Herdr and spawns real Pi agents on a cheap model:
 
-Covered:
-spawn, lifecycle completion, model routing, peer messaging,
-agent controls, worktree isolation, concurrency and nesting.
+```bash
+# from a pane inside Herdr (HERDR_ENV / HERDR_PANE_ID / HERDR_SOCKET_PATH are set there)
+bun run e2e
+# or by hand
+HERDR_ENV=1 HERDR_PANE_ID=wM:p1 HERDR_SOCKET_PATH=$HOME/.config/herdr/herdr.sock bun run e2e
+```
+
+`PI_HERDR_FLEET_E2E_MODEL` / `PI_HERDR_FLEET_E2E_THINKING` pick the model (default `opencode-go/glm-5.3-flash:low`). Covered live: spawn with a long multiline task (the pre-visual idle regression), event-driven settlement and `closeOnSettle`, follow-up `agent_send` to a settled agent, back-to-back spawns. Last verified with Herdr 0.8.2 and Pi 0.85.1.
 
 Blocked and startup-blocked paths are covered by orchestrator unit tests (`agent_blocked`, `agent_not_ready`). Live Herdr approval-UI E2E is still not in the deterministic suite.
 
